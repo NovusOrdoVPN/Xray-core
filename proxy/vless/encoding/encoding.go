@@ -158,8 +158,24 @@ func DecodeResponseHeader(reader io.Reader, request *protocol.RequestHeader) (*A
 		return nil, errors.New("failed to read response version").Base(err)
 	}
 
-	if buffer.Byte(0) != request.Version {
-		return nil, errors.New("unexpected response version. Expecting ", int(request.Version), " but actually ", int(buffer.Byte(0)))
+	firstByte := buffer.Byte(0)
+
+	// Check for server error response (XERR magic)
+	if firstByte == 'X' {
+		serverErr, parseErr := TryParseServerError(reader, firstByte)
+		if parseErr != nil {
+			return nil, errors.New("failed to parse server error response").Base(parseErr)
+		}
+		if serverErr != nil {
+			// Return the ServerError as the error - it implements the error interface
+			return nil, serverErr
+		}
+		// If TryParseServerError returns nil, nil - it wasn't actually XERR
+		// Fall through to normal version check (will fail since 'X' != 0x00)
+	}
+
+	if firstByte != request.Version {
+		return nil, errors.New("unexpected response version. Expecting ", int(request.Version), " but actually ", int(firstByte))
 	}
 
 	responseAddons, err := DecodeHeaderAddons(&buffer, reader)

@@ -35,6 +35,9 @@ type inflightCall struct {
 	heartbeat   time.Duration
 	denyTTL     time.Duration
 	err         error
+	// error details from tower (when denied)
+	errorCode int
+	errorMsg  string
 }
 
 type cachedStatus struct {
@@ -47,6 +50,8 @@ type cachedStatus struct {
 
 	// If denied:
 	denyUntil time.Time // short negative cache (e.g. 30s)
+	errorCode int       // error code from tower (for client error response)
+	errorMsg  string    // error message from tower (for client error response)
 }
 
 func newRemoteValidator(local *vless.MemoryValidator, endpoint string) vless.Validator {
@@ -95,7 +100,7 @@ func (r *remoteValidator) Get(id uuid.UUID) *protocol.MemoryUser {
 		}
 	}
 
-	allowed, decisionTTL, heartbeat, denyTTL := r.checkRemoteDedup(key)
+	allowed, decisionTTL, heartbeat, denyTTL, errorCode, errorMsg := r.checkRemoteDedup(key)
 
 	// Update cache
 	if !allowed {
@@ -103,6 +108,8 @@ func (r *remoteValidator) Get(id uuid.UUID) *protocol.MemoryUser {
 			allowed:   false,
 			reason:    "denied",
 			denyUntil: now.Add(denyTTL),
+			errorCode: errorCode,
+			errorMsg:  errorMsg,
 		})
 		return nil
 	}
@@ -130,6 +137,18 @@ func (r *remoteValidator) GetByEmail(email string) *protocol.MemoryUser {
 func (r *remoteValidator) GetAll() []*protocol.MemoryUser { return r.local.GetAll() }
 func (r *remoteValidator) GetCount() int64                { return r.local.GetCount() }
 
+// GetLastError returns the error code and message for a denied UUID from cache.
+// Returns (0, "") if the UUID is not in cache or was not denied.
+func (r *remoteValidator) GetLastError(id uuid.UUID) (code int, msg string) {
+	key := id.String()
+	if v, ok := r.cache.Load(key); ok {
+		if e, ok := v.(cachedStatus); ok && !e.allowed {
+			return e.errorCode, e.errorMsg
+		}
+	}
+	return 0, ""
+}
+
 func (r *remoteValidator) syntheticUser(id uuid.UUID) *protocol.MemoryUser {
 	return &protocol.MemoryUser{
 		Account: &vless.MemoryAccount{
@@ -139,7 +158,7 @@ func (r *remoteValidator) syntheticUser(id uuid.UUID) *protocol.MemoryUser {
 }
 
 // Deduplicate tower calls per uuid key.
-func (r *remoteValidator) checkRemoteDedup(uuidStr string) (allowed bool, decisionTTL, heartbeat, denyTTL time.Duration) {
+func (r *remoteValidator) checkRemoteDedup(uuidStr string) (allowed bool, decisionTTL, heartbeat, denyTTL time.Duration, errorCode int, errorMsg string) {
 	// defaults (safe and low load)
 	defaultDecision := 6 * time.Hour
 	defaultHeartbeat := 30 * time.Minute
@@ -151,9 +170,9 @@ func (r *remoteValidator) checkRemoteDedup(uuidStr string) (allowed bool, decisi
 		c.wg.Wait()
 		if c.err != nil {
 			// On tower error: conservative deny (you can choose allow-if-previously-allowed via cache logic)
-			return false, 0, 0, 10 * time.Second
+			return false, 0, 0, 10 * time.Second, 0, ""
 		}
-		return c.allowed, c.decisionTTL, c.heartbeat, c.denyTTL
+		return c.allowed, c.decisionTTL, c.heartbeat, c.denyTTL, c.errorCode, c.errorMsg
 	}
 
 	c := &inflightCall{}
@@ -168,31 +187,33 @@ func (r *remoteValidator) checkRemoteDedup(uuidStr string) (allowed bool, decisi
 		c.wg.Done()
 	}()
 
-	a, dTTL, hb, dny, err := r.checkRemote(uuidStr, defaultDecision, defaultHeartbeat, defaultDeny)
+	a, dTTL, hb, dny, errCode, errMsg, err := r.checkRemote(uuidStr, defaultDecision, defaultHeartbeat, defaultDeny)
 	c.allowed = a
 	c.decisionTTL = dTTL
 	c.heartbeat = hb
 	c.denyTTL = dny
+	c.errorCode = errCode
+	c.errorMsg = errMsg
 	c.err = err
 
 	if err != nil {
-		return false, 0, 0, 10 * time.Second
+		return false, 0, 0, 10 * time.Second, 0, ""
 	}
-	return a, dTTL, hb, dny
+	return a, dTTL, hb, dny, errCode, errMsg
 }
 
-func (r *remoteValidator) checkRemote(uuidStr string, defDecision, defHeartbeat, defDeny time.Duration) (allowed bool, decisionTTL, heartbeat, denyTTL time.Duration, err error) {
+func (r *remoteValidator) checkRemote(uuidStr string, defDecision, defHeartbeat, defDeny time.Duration) (allowed bool, decisionTTL, heartbeat, denyTTL time.Duration, errorCode int, errorMsg string, err error) {
 	payload := map[string]string{"uuid": uuidStr} // matches tower endpoint
 	body, err := json.Marshal(payload)
 	if err != nil {
 		errors.LogInfo(context.Background(), "remote validator marshal error: ", err)
-		return false, 0, 0, 0, err
+		return false, 0, 0, 0, 0, "", err
 	}
 
 	req, err := http.NewRequest(http.MethodPost, r.endpoint, bytes.NewReader(body))
 	if err != nil {
 		errors.LogInfo(context.Background(), "remote validator request build error: ", err)
-		return false, 0, 0, 0, err
+		return false, 0, 0, 0, 0, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -201,25 +222,27 @@ func (r *remoteValidator) checkRemote(uuidStr string, defDecision, defHeartbeat,
 	resp, err := r.client.Do(req)
 	if err != nil {
 		errors.LogInfo(context.Background(), "remote validator http error: ", err)
-		return false, 0, 0, 0, err
+		return false, 0, 0, 0, 0, "", err
 	}
 	defer resp.Body.Close()
 
 	// Tower returns 200 even for deny (status=1). Treat non-2xx as error.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errors.LogInfo(context.Background(), "remote validator bad status: ", resp.StatusCode)
-		return false, 0, 0, 0, errors.New("tower bad status")
+		return false, 0, 0, 0, 0, "", errors.New("tower bad status")
 	}
 
 	var result struct {
-		Status         int `json:"status"` // 0 = allow
-		DecisionTTLSec int `json:"decisionTtlSec"`
-		HeartbeatSec   int `json:"heartbeatSec"`
-		TTLSec         int `json:"ttlSec"` // deny cache ttl
+		Status         int    `json:"status"`       // 0 = allow
+		ErrorCode      int    `json:"errorCode"`    // error code for client (when denied)
+		ErrorMessage   string `json:"errorMessage"` // error message for client (when denied)
+		DecisionTTLSec int    `json:"decisionTtlSec"`
+		HeartbeatSec   int    `json:"heartbeatSec"`
+		TTLSec         int    `json:"ttlSec"` // deny cache ttl
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		errors.LogInfo(context.Background(), "remote validator decode error: ", err)
-		return false, 0, 0, 0, err
+		return false, 0, 0, 0, 0, "", err
 	}
 
 	// Use tower TTLs as-is; only apply safety clamps to avoid spamming tower too quickly.
@@ -264,7 +287,7 @@ func (r *remoteValidator) checkRemote(uuidStr string, defDecision, defHeartbeat,
 	}
 
 	allowed = (result.Status == 0)
-	return allowed, decisionTTL, heartbeat, denyTTL, nil
+	return allowed, decisionTTL, heartbeat, denyTTL, result.ErrorCode, result.ErrorMessage, nil
 }
 
 func (r *remoteValidator) startJanitor(interval time.Duration) {
