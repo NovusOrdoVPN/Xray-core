@@ -328,11 +328,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	// Send XERR error response if validation failed
 	if err != nil && strings.Contains(err.Error(), "invalid request user id") {
 		if remoteVal, ok := h.validator.(*remoteValidator); ok {
-			// Extract UUID from the first buffer (bytes 1-17, after version byte)
-			if firstLen >= 17 {
+			// Use userSentID which was already extracted by DecodeRequestHeader
+			// (we can't re-extract from first buffer as its position has advanced)
+			if len(userSentID) == 16 {
 				var id uuid.UUID
-				copy(id[:], first.BytesRange(1, 17))
-				errors.LogInfo(ctx, "XERR: extracted UUID for GetLastError: ", id.String())
+				copy(id[:], userSentID)
+				errors.LogInfo(ctx, "XERR: using userSentID for GetLastError: ", id.String())
 				code, msg := remoteVal.GetLastError(id)
 				// Use default error if tower didn't provide specific details
 				if code == 0 {
