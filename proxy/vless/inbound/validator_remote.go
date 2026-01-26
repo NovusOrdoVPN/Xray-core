@@ -101,11 +101,9 @@ func (r *remoteValidator) Get(id uuid.UUID) *protocol.MemoryUser {
 	}
 
 	allowed, decisionTTL, heartbeat, denyTTL, errorCode, errorMsg := r.checkRemoteDedup(key)
-	errors.LogInfo(context.Background(), "Get checkRemoteDedup result: key=", key, " allowed=", allowed, " errorCode=", errorCode, " errorMsg=", errorMsg)
 
 	// Update cache
 	if !allowed {
-		errors.LogInfo(context.Background(), "Get storing denied entry: key=", key, " errorCode=", errorCode, " errorMsg=", errorMsg)
 		r.cache.Store(key, cachedStatus{
 			allowed:   false,
 			reason:    "denied",
@@ -143,16 +141,10 @@ func (r *remoteValidator) GetCount() int64                { return r.local.GetCo
 // Returns (0, "") if the UUID is not in cache or was not denied.
 func (r *remoteValidator) GetLastError(id uuid.UUID) (code int, msg string) {
 	key := id.String()
-	errors.LogInfo(context.Background(), "GetLastError called for key: ", key)
 	if v, ok := r.cache.Load(key); ok {
-		errors.LogInfo(context.Background(), "GetLastError cache hit for key: ", key)
 		if e, ok := v.(cachedStatus); ok && !e.allowed {
-			errors.LogInfo(context.Background(), "GetLastError returning errorCode=", e.errorCode, " errorMsg=", e.errorMsg)
 			return e.errorCode, e.errorMsg
 		}
-		errors.LogInfo(context.Background(), "GetLastError cache entry allowed or type assertion failed")
-	} else {
-		errors.LogInfo(context.Background(), "GetLastError cache miss for key: ", key)
 	}
 	return 0, ""
 }
@@ -252,7 +244,6 @@ func (r *remoteValidator) checkRemote(uuidStr string, defDecision, defHeartbeat,
 		errors.LogInfo(context.Background(), "remote validator decode error: ", err)
 		return false, 0, 0, 0, 0, "", err
 	}
-	errors.LogInfo(context.Background(), "checkRemote tower response: status=", result.Status, " errorCode=", result.ErrorCode, " errorMessage=", result.ErrorMessage)
 
 	// Use tower TTLs as-is; only apply safety clamps to avoid spamming tower too quickly.
 	const (

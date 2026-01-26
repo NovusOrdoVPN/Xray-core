@@ -333,7 +333,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			if len(userSentID) == 16 {
 				var id uuid.UUID
 				copy(id[:], userSentID)
-				errors.LogInfo(ctx, "XERR: using userSentID for GetLastError: ", id.String())
 				code, msg := remoteVal.GetLastError(id)
 				// Use default error if tower didn't provide specific details
 				if code == 0 {
