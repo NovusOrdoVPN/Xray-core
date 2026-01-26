@@ -325,20 +325,25 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		userSentID, request, requestAddons, isfb, err = encoding.DecodeRequestHeader(isfb, first, reader, h.validator)
 	}
 
-	// Send XERR error response if validation failed and we have error details from remote validator
+	// Send XERR error response if validation failed
 	if err != nil && strings.Contains(err.Error(), "invalid request user id") {
 		if remoteVal, ok := h.validator.(*remoteValidator); ok {
 			// Extract UUID from the first buffer (bytes 1-17, after version byte)
 			if firstLen >= 17 {
 				var id uuid.UUID
 				copy(id[:], first.BytesRange(1, 17))
-				if code, msg := remoteVal.GetLastError(id); code != 0 {
-					severity := GetSeverityForCode(code)
-					if sendErr := SendErrorResponse(connection, severity, byte(code), msg); sendErr != nil {
-						errors.LogWarningInner(ctx, sendErr, "failed to send XERR error response")
-					} else {
-						errors.LogInfo(ctx, "sent XERR error response: code=", code, " msg=", msg)
-					}
+				errors.LogInfo(ctx, "XERR: extracted UUID for GetLastError: ", id.String())
+				code, msg := remoteVal.GetLastError(id)
+				// Use default error if tower didn't provide specific details
+				if code == 0 {
+					code = ErrInvalidUUID
+					msg = "Invalid or unknown user ID"
+				}
+				severity := GetSeverityForCode(code)
+				if sendErr := SendErrorResponse(connection, severity, byte(code), msg); sendErr != nil {
+					errors.LogWarningInner(ctx, sendErr, "failed to send XERR error response")
+				} else {
+					errors.LogInfo(ctx, "sent XERR error response: code=", code, " msg=", msg)
 				}
 			}
 		}
