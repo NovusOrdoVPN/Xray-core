@@ -584,6 +584,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	responseAddons := &encoding.Addons{
 		// Flow: requestAddons.Flow,
+		AuthVerified: true,
 	}
 
 	var input *bytes.Reader

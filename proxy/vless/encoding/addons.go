@@ -15,8 +15,8 @@ import (
 )
 
 func EncodeHeaderAddons(buffer *buf.Buffer, addons *Addons) error {
-	switch addons.Flow {
-	case vless.XRV:
+	needsProtobuf := addons.Flow == vless.XRV || addons.AuthVerified
+	if needsProtobuf {
 		bytes, err := proto.Marshal(addons)
 		if err != nil {
 			return errors.New("failed to marshal addons protobuf value").Base(err)
@@ -27,7 +27,7 @@ func EncodeHeaderAddons(buffer *buf.Buffer, addons *Addons) error {
 		if _, err := buffer.Write(bytes); err != nil {
 			return errors.New("failed to write addons protobuf value").Base(err)
 		}
-	default:
+	} else {
 		if err := buffer.WriteByte(0); err != nil {
 			return errors.New("failed to write addons protobuf length").Base(err)
 		}
