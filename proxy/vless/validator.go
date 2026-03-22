@@ -11,6 +11,9 @@ import (
 
 type Validator interface {
 	Get(id uuid.UUID) *protocol.MemoryUser
+	// GetWithMeta validates the UUID and passes client metadata (e.g. app version)
+	// to the validation backend. Falls back to Get() for validators that don't need metadata.
+	GetWithMeta(id uuid.UUID, clientVersion string) *protocol.MemoryUser
 	Add(u *protocol.MemoryUser) error
 	Del(email string) error
 	GetByEmail(email string) *protocol.MemoryUser
@@ -56,6 +59,11 @@ func (v *MemoryValidator) Del(e string) error {
 	v.email.Delete(le)
 	v.users.Delete(ProcessUUID(u.(*protocol.MemoryUser).Account.(*MemoryAccount).ID.UUID()))
 	return nil
+}
+
+// GetWithMeta validates UUID — MemoryValidator ignores clientVersion.
+func (v *MemoryValidator) GetWithMeta(id uuid.UUID, clientVersion string) *protocol.MemoryUser {
+	return v.Get(id)
 }
 
 // Get a VLESS user with UUID, nil if user doesn't exist.

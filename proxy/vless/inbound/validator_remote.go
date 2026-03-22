@@ -72,6 +72,10 @@ func (r *remoteValidator) Add(u *protocol.MemoryUser) error { return r.local.Add
 func (r *remoteValidator) Del(email string) error           { return r.local.Del(email) }
 
 func (r *remoteValidator) Get(id uuid.UUID) *protocol.MemoryUser {
+	return r.GetWithMeta(id, "")
+}
+
+func (r *remoteValidator) GetWithMeta(id uuid.UUID, clientVersion string) *protocol.MemoryUser {
 	// IMPORTANT: keep UUID intact (exactly what client uses/sends in VLESS).
 	key := id.String()
 
@@ -100,7 +104,7 @@ func (r *remoteValidator) Get(id uuid.UUID) *protocol.MemoryUser {
 		}
 	}
 
-	allowed, decisionTTL, heartbeat, denyTTL, errorCode, errorMsg := r.checkRemoteDedup(key)
+	allowed, decisionTTL, heartbeat, denyTTL, errorCode, errorMsg := r.checkRemoteDedup(key, clientVersion)
 
 	// Update cache
 	if !allowed {
@@ -158,7 +162,7 @@ func (r *remoteValidator) syntheticUser(id uuid.UUID) *protocol.MemoryUser {
 }
 
 // Deduplicate tower calls per uuid key.
-func (r *remoteValidator) checkRemoteDedup(uuidStr string) (allowed bool, decisionTTL, heartbeat, denyTTL time.Duration, errorCode int, errorMsg string) {
+func (r *remoteValidator) checkRemoteDedup(uuidStr string, clientVersion string) (allowed bool, decisionTTL, heartbeat, denyTTL time.Duration, errorCode int, errorMsg string) {
 	// defaults (safe and low load)
 	defaultDecision := 6 * time.Hour
 	defaultHeartbeat := 30 * time.Minute
@@ -187,7 +191,7 @@ func (r *remoteValidator) checkRemoteDedup(uuidStr string) (allowed bool, decisi
 		c.wg.Done()
 	}()
 
-	a, dTTL, hb, dny, errCode, errMsg, err := r.checkRemote(uuidStr, defaultDecision, defaultHeartbeat, defaultDeny)
+	a, dTTL, hb, dny, errCode, errMsg, err := r.checkRemote(uuidStr, clientVersion, defaultDecision, defaultHeartbeat, defaultDeny)
 	c.allowed = a
 	c.decisionTTL = dTTL
 	c.heartbeat = hb
@@ -202,8 +206,11 @@ func (r *remoteValidator) checkRemoteDedup(uuidStr string) (allowed bool, decisi
 	return a, dTTL, hb, dny, errCode, errMsg
 }
 
-func (r *remoteValidator) checkRemote(uuidStr string, defDecision, defHeartbeat, defDeny time.Duration) (allowed bool, decisionTTL, heartbeat, denyTTL time.Duration, errorCode int, errorMsg string, err error) {
-	payload := map[string]string{"uuid": uuidStr} // matches tower endpoint
+func (r *remoteValidator) checkRemote(uuidStr string, clientVersion string, defDecision, defHeartbeat, defDeny time.Duration) (allowed bool, decisionTTL, heartbeat, denyTTL time.Duration, errorCode int, errorMsg string, err error) {
+	payload := map[string]string{"uuid": uuidStr}
+	if clientVersion != "" {
+		payload["clientVersion"] = clientVersion
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		errors.LogInfo(context.Background(), "remote validator marshal error: ", err)

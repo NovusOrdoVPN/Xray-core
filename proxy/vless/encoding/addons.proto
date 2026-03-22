@@ -10,4 +10,5 @@ message Addons {
   string Flow = 1;
   bytes Seed = 2;
   bool AuthVerified = 3;
+  string ClientVersion = 4;
 }

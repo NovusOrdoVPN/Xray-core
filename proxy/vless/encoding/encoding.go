@@ -90,18 +90,20 @@ func DecodeRequestHeader(isfb bool, first *buf.Buffer, reader io.Reader, validat
 			copy(id[:], buffer.Bytes())
 		}
 
-		if request.User = validator.Get(id); request.User == nil {
-			// Return id[:] so the caller can use it for error handling (e.g., XERR response)
-			return id[:], nil, nil, isfb, errors.New("invalid request user id")
-		}
-
 		if isfb {
 			first.Advance(17)
 		}
 
+		// Decode addons BEFORE validator.Get() so ClientVersion is available
+		// for the very first tower validation call.
 		requestAddons, err := DecodeHeaderAddons(&buffer, reader)
 		if err != nil {
 			return nil, nil, nil, false, errors.New("failed to decode request header addons").Base(err)
+		}
+
+		// Validate UUID with tower — clientVersion from addons is now available.
+		if request.User = validator.GetWithMeta(id, requestAddons.GetClientVersion()); request.User == nil {
+			return id[:], nil, nil, false, errors.New("invalid request user id")
 		}
 
 		buffer.Clear()
