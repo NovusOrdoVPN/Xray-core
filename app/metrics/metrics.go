@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"encoding/json"
 	"expvar"
 	"net/http"
 	_ "net/http/pprof"
@@ -69,7 +70,9 @@ func NewMetricsHandler(ctx context.Context, config *Config) (*MetricsHandler, er
 		}
 		resp := map[string]int{}
 		manager.VisitOnlineMaps(func(name string, om *stats.OnlineMap) bool {
-			resp[name] = om.Count()
+			if strings.HasPrefix(name, "inbound>>>") {
+				resp[name] = om.Count()
+			}
 			return true
 		})
 		return resp
@@ -94,6 +97,27 @@ func NewMetricsHandler(ctx context.Context, config *Config) (*MetricsHandler, er
 		}
 		return resp
 	}))
+	http.HandleFunc("/online", func(w http.ResponseWriter, r *http.Request) {
+		manager, ok := c.statsManager.(*stats.Manager)
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		resp := map[string]int{}
+		manager.VisitOnlineMaps(func(name string, om *stats.OnlineMap) bool {
+			if strings.HasPrefix(name, "inbound>>>") {
+				// Extract tag from "inbound>>>tag>>>online"
+				parts := strings.Split(name, ">>>")
+				if len(parts) >= 2 {
+					resp[parts[1]] = om.Count()
+				}
+			}
+			return true
+		})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	return c, nil
 }
 
