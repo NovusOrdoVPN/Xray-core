@@ -155,6 +155,7 @@ func (r *remoteValidator) GetLastError(id uuid.UUID) (code int, msg string) {
 
 func (r *remoteValidator) syntheticUser(id uuid.UUID) *protocol.MemoryUser {
 	return &protocol.MemoryUser{
+		Email: id.String() + "@remote",
 		Account: &vless.MemoryAccount{
 			ID: protocol.NewID(id),
 		},

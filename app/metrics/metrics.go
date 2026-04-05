@@ -62,6 +62,18 @@ func NewMetricsHandler(ctx context.Context, config *Config) (*MetricsHandler, er
 		})
 		return resp
 	}))
+	expvar.Publish("online", expvar.Func(func() interface{} {
+		manager, ok := c.statsManager.(*stats.Manager)
+		if !ok {
+			return nil
+		}
+		resp := map[string]int{}
+		manager.VisitOnlineMaps(func(name string, om *stats.OnlineMap) bool {
+			resp[name] = om.Count()
+			return true
+		})
+		return resp
+	}))
 	expvar.Publish("observatory", expvar.Func(func() interface{} {
 		if c.observatory == nil {
 			common.Must(core.RequireFeatures(ctx, func(observatory extension.Observatory) error {

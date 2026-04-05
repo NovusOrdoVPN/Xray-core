@@ -83,6 +83,18 @@ func (m *Manager) VisitCounters(visitor func(string, stats.Counter) bool) {
 	}
 }
 
+// VisitOnlineMaps calls visitor function on all managed online maps.
+func (m *Manager) VisitOnlineMaps(visitor func(string, *OnlineMap) bool) {
+	m.access.RLock()
+	defer m.access.RUnlock()
+
+	for name, om := range m.onlineMap {
+		if !visitor(name, om) {
+			break
+		}
+	}
+}
+
 // RegisterOnlineMap implements stats.Manager.
 func (m *Manager) RegisterOnlineMap(name string) (stats.OnlineMap, error) {
 	m.access.Lock()

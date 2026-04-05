@@ -181,14 +181,20 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		}
 
 		if p.Stats.UserOnline {
+			// Per-user online map (tracks IPs per user)
 			name := "user>>>" + user.Email + ">>>online"
 			if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
 				sessionInbounds := session.InboundFromContext(ctx)
 				userIP := sessionInbounds.Source.Address.String()
 				om.AddIP(userIP)
-				// log Online user with ips
-				// errors.LogDebug(ctx, "user>>>" + user.Email + ">>>online", om.Count(), om.List())
+			}
 
+			// Global inbound online map (tracks unique UUIDs across all connections)
+			if sessionInbound != nil && sessionInbound.Tag != "" {
+				globalName := "inbound>>>" + sessionInbound.Tag + ">>>online"
+				if gom, _ := stats.GetOrRegisterOnlineMap(d.stats, globalName); gom != nil {
+					gom.AddIP(user.Email)
+				}
 			}
 		}
 	}
@@ -223,13 +229,20 @@ func (d *DefaultDispatcher) WrapLink(ctx context.Context, link *transport.Link) 
 			}
 		}
 		if p.Stats.UserOnline {
+			// Per-user online map (tracks IPs per user)
 			name := "user>>>" + user.Email + ">>>online"
 			if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
 				sessionInbounds := session.InboundFromContext(ctx)
 				userIP := sessionInbounds.Source.Address.String()
 				om.AddIP(userIP)
-				// log Online user with ips
-				// errors.LogDebug(ctx, "user>>>" + user.Email + ">>>online", om.Count(), om.List())
+			}
+
+			// Global inbound online map (tracks unique UUIDs across all connections)
+			if sessionInbound != nil && sessionInbound.Tag != "" {
+				globalName := "inbound>>>" + sessionInbound.Tag + ">>>online"
+				if gom, _ := stats.GetOrRegisterOnlineMap(d.stats, globalName); gom != nil {
+					gom.AddIP(user.Email)
+				}
 			}
 		}
 	}
