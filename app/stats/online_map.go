@@ -84,5 +84,13 @@ func (c *OnlineMap) IpTimeMap() map[string]time.Time {
 		c.lastCleanup = time.Now()
 	}
 
-	return c.ipList
+	c.access.RLock()
+	defer c.access.RUnlock()
+
+	cloned := make(map[string]time.Time, len(c.ipList))
+	for k, v := range c.ipList {
+		cloned[k] = v
+	}
+
+	return cloned
 }

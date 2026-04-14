@@ -21,11 +21,22 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	routing_session "github.com/xtls/xray-core/features/routing/session"
 	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
 var errSniffingTimeout = errors.New("timeout on sniffing")
+
+func userOnlineIdentity(user *protocol.MemoryUser) string {
+	if user == nil {
+		return ""
+	}
+	if account, ok := user.Account.(*vless.MemoryAccount); ok && account.ID != nil {
+		return account.ID.String()
+	}
+	return user.Email
+}
 
 type cachedReader struct {
 	sync.Mutex
@@ -159,9 +170,10 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		user = sessionInbound.User
 	}
 
-	if user != nil && len(user.Email) > 0 {
+	if user != nil {
+		onlineIdentity := userOnlineIdentity(user)
 		p := d.policy.ForLevel(user.Level)
-		if p.Stats.UserUplink {
+		if len(user.Email) > 0 && p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
 				inboundLink.Writer = &SizeStatWriter{
@@ -170,7 +182,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 				}
 			}
 		}
-		if p.Stats.UserDownlink {
+		if len(user.Email) > 0 && p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
 				outboundLink.Writer = &SizeStatWriter{
@@ -182,18 +194,20 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 
 		if p.Stats.UserOnline {
 			// Per-user online map (tracks IPs per user)
-			name := "user>>>" + user.Email + ">>>online"
-			if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
-				sessionInbounds := session.InboundFromContext(ctx)
-				userIP := sessionInbounds.Source.Address.String()
-				om.AddIP(userIP)
+			if len(user.Email) > 0 {
+				name := "user>>>" + user.Email + ">>>online"
+				if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
+					sessionInbounds := session.InboundFromContext(ctx)
+					userIP := sessionInbounds.Source.Address.String()
+					om.AddIP(userIP)
+				}
 			}
 
 			// Global inbound online map (tracks unique UUIDs across all connections)
-			if sessionInbound != nil && sessionInbound.Tag != "" {
+			if sessionInbound != nil && sessionInbound.Tag != "" && onlineIdentity != "" {
 				globalName := "inbound>>>" + sessionInbound.Tag + ">>>online"
 				if gom, _ := stats.GetOrRegisterOnlineMap(d.stats, globalName); gom != nil {
-					gom.AddIP(user.Email)
+					gom.AddIP(onlineIdentity)
 				}
 			}
 		}
@@ -211,15 +225,16 @@ func (d *DefaultDispatcher) WrapLink(ctx context.Context, link *transport.Link) 
 
 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
 
-	if user != nil && len(user.Email) > 0 {
+	if user != nil {
+		onlineIdentity := userOnlineIdentity(user)
 		p := d.policy.ForLevel(user.Level)
-		if p.Stats.UserUplink {
+		if len(user.Email) > 0 && p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
 				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
 			}
 		}
-		if p.Stats.UserDownlink {
+		if len(user.Email) > 0 && p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
 				link.Writer = &SizeStatWriter{
@@ -230,18 +245,20 @@ func (d *DefaultDispatcher) WrapLink(ctx context.Context, link *transport.Link) 
 		}
 		if p.Stats.UserOnline {
 			// Per-user online map (tracks IPs per user)
-			name := "user>>>" + user.Email + ">>>online"
-			if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
-				sessionInbounds := session.InboundFromContext(ctx)
-				userIP := sessionInbounds.Source.Address.String()
-				om.AddIP(userIP)
+			if len(user.Email) > 0 {
+				name := "user>>>" + user.Email + ">>>online"
+				if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
+					sessionInbounds := session.InboundFromContext(ctx)
+					userIP := sessionInbounds.Source.Address.String()
+					om.AddIP(userIP)
+				}
 			}
 
 			// Global inbound online map (tracks unique UUIDs across all connections)
-			if sessionInbound != nil && sessionInbound.Tag != "" {
+			if sessionInbound != nil && sessionInbound.Tag != "" && onlineIdentity != "" {
 				globalName := "inbound>>>" + sessionInbound.Tag + ">>>online"
 				if gom, _ := stats.GetOrRegisterOnlineMap(d.stats, globalName); gom != nil {
-					gom.AddIP(user.Email)
+					gom.AddIP(onlineIdentity)
 				}
 			}
 		}

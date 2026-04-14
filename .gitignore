@@ -56,6 +56,9 @@ errorgen
 # Coverage reports
 coverage.*
 
+# Local Go build cache used for sandboxed test runs
+.gocache/
+
 # Node modules (in case of frontend assets)
 node_modules/
 

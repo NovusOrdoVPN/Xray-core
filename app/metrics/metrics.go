@@ -7,6 +7,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"strings"
+	"time"
 
 	"github.com/xtls/xray-core/app/observatory"
 	"github.com/xtls/xray-core/app/stats"
@@ -27,6 +28,87 @@ type MetricsHandler struct {
 	tag          string
 	listen       string
 	tcpListener  net.Listener
+}
+
+type onlineUsersResponse struct {
+	AsOfMs int64            `json:"asOfMs"`
+	Direct map[string]int64 `json:"direct"`
+	Proxy  map[string]int64 `json:"proxy"`
+}
+
+type onlineUserPresence struct {
+	mode       string
+	lastSeenMs int64
+}
+
+func inboundTagFromOnlineMapName(name string) string {
+	parts := strings.Split(name, ">>>")
+	if len(parts) >= 2 {
+		return parts[1]
+	}
+	return ""
+}
+
+func classifyOnlineMode(tag string) string {
+	if strings.Contains(strings.ToLower(tag), "proxy") {
+		return "proxy"
+	}
+	return "direct"
+}
+
+func buildOnlineUsersResponse(manager *stats.Manager) onlineUsersResponse {
+	rawByMode := map[string]map[string]int64{
+		"direct": {},
+		"proxy":  {},
+	}
+
+	manager.VisitOnlineMaps(func(name string, om *stats.OnlineMap) bool {
+		if !strings.HasPrefix(name, "inbound>>>") {
+			return true
+		}
+
+		tag := inboundTagFromOnlineMapName(name)
+		if tag == "" {
+			return true
+		}
+
+		mode := classifyOnlineMode(tag)
+		for userID, lastSeen := range om.IpTimeMap() {
+			lastSeenMs := lastSeen.UnixMilli()
+			if current, found := rawByMode[mode][userID]; !found || lastSeenMs > current {
+				rawByMode[mode][userID] = lastSeenMs
+			}
+		}
+
+		return true
+	})
+
+	winners := make(map[string]onlineUserPresence)
+	for _, mode := range []string{"direct", "proxy"} {
+		for userID, lastSeenMs := range rawByMode[mode] {
+			if existing, found := winners[userID]; !found || lastSeenMs > existing.lastSeenMs {
+				winners[userID] = onlineUserPresence{
+					mode:       mode,
+					lastSeenMs: lastSeenMs,
+				}
+			}
+		}
+	}
+
+	resp := onlineUsersResponse{
+		AsOfMs: time.Now().UnixMilli(),
+		Direct: map[string]int64{},
+		Proxy:  map[string]int64{},
+	}
+	for userID, presence := range winners {
+		if presence.mode == "proxy" {
+			resp.Proxy[userID] = presence.lastSeenMs
+		} else {
+			resp.Direct[userID] = presence.lastSeenMs
+		}
+	}
+
+	return resp
 }
 
 // NewMetricsHandler creates a new MetricsHandler based on the given config.
@@ -116,6 +198,16 @@ func NewMetricsHandler(ctx context.Context, config *Config) (*MetricsHandler, er
 		})
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
+	})
+	http.HandleFunc("/online-users", func(w http.ResponseWriter, r *http.Request) {
+		manager, ok := c.statsManager.(*stats.Manager)
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(buildOnlineUsersResponse(manager))
 	})
 
 	return c, nil
