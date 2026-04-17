@@ -10,4 +10,5 @@ import "common/protocol/server_spec.proto";
 
 message Config {
   xray.common.protocol.ServerEndpoint vnext = 1;
+  bool relay = 2;
 }

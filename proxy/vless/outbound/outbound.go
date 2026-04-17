@@ -52,6 +52,7 @@ type Handler struct {
 	server        *protocol.ServerSpec
 	policyManager policy.Manager
 	cone          bool
+	relay         bool
 	encryption    *encryption.ClientInstance
 	reverse       *Reverse
 
@@ -80,6 +81,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		cone:          ctx.Value("cone").(bool),
+		relay:         config.GetRelay(),
 	}
 
 	a := handler.server.User.Account.(*vless.MemoryAccount)
@@ -222,9 +224,28 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}
 
+	// In relay mode, use the original client UUID and ClientVersion instead of configured ones.
+	user := rec.User
+	var relayClientVersion string
+	if h.relay {
+		ib := session.InboundFromContext(ctx)
+		if ib != nil && len(ib.RelayUUID) == 16 {
+			var relayID [16]byte
+			copy(relayID[:], ib.RelayUUID)
+			account := rec.User.Account.(*vless.MemoryAccount)
+			user = &protocol.MemoryUser{
+				Account: &vless.MemoryAccount{ID: protocol.NewID(relayID), Flow: account.Flow},
+				Level:   rec.User.Level,
+			}
+			relayClientVersion = ib.RelayClientVersion
+		} else {
+			errors.LogDebug(ctx, "relay outbound: no RelayUUID in inbound context — falling back to configured UUID (possible misconfig or non-VLESS inbound)")
+		}
+	}
+
 	request := &protocol.RequestHeader{
 		Version: encoding.Version,
-		User:    rec.User,
+		User:    user,
 		Command: command,
 		Address: target.Address,
 		Port:    target.Port,
@@ -234,6 +255,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	requestAddons := &encoding.Addons{
 		Flow: account.Flow,
+	}
+	if relayClientVersion != "" {
+		requestAddons.ClientVersion = relayClientVersion
 	}
 
 	var input *bytes.Reader

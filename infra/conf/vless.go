@@ -224,6 +224,7 @@ type VLessOutboundConfig struct {
 	Testpre    uint32                `json:"testpre"`
 	Testseed   []uint32              `json:"testseed"`
 	Vnext      []*VLessOutboundVnext `json:"vnext"`
+	Relay      bool                  `json:"relay"`
 }
 
 // Build implements Buildable
@@ -344,6 +345,7 @@ func (c *VLessOutboundConfig) Build() (proto.Message, error) {
 		config.Vnext = spec
 		break
 	}
+	config.Relay = c.Relay
 
 	return config, nil
 }
