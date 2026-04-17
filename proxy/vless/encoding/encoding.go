@@ -3,6 +3,7 @@ package encoding
 import (
 	"context"
 	"io"
+	"sync"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -17,6 +18,67 @@ import (
 const (
 	Version = byte(0)
 )
+
+// CUSTOM-BEGIN: client-side VLESS session state (gomobile-facing API).
+//
+// The gomobile wrapper (xray_mobile_library/vpntoolcore/xray.go) calls these
+// functions directly — removing them would break the mobile build. Keep this
+// block intact when syncing from upstream.
+
+// Auth callback — fired once per VPN session when server sends AuthVerified=true.
+var (
+	authCallbackMu   sync.Mutex
+	authCallback     func()
+	authCallbackOnce sync.Once
+)
+
+// SetAuthVerifiedCallback registers a callback to be fired once when the server
+// confirms authentication. Call ResetAuthVerifiedCallback before each VPN session.
+func SetAuthVerifiedCallback(cb func()) {
+	authCallbackMu.Lock()
+	defer authCallbackMu.Unlock()
+	authCallback = cb
+	authCallbackOnce = sync.Once{} // reset for new session
+}
+
+// ResetAuthVerifiedCallback resets the once guard so the callback can fire again
+// on the next VPN connection.
+func ResetAuthVerifiedCallback() {
+	authCallbackMu.Lock()
+	defer authCallbackMu.Unlock()
+	authCallbackOnce = sync.Once{}
+}
+
+func fireAuthVerified() {
+	authCallbackMu.Lock()
+	cb := authCallback
+	authCallbackMu.Unlock()
+	if cb != nil {
+		authCallbackOnce.Do(cb)
+	}
+}
+
+// Client version — set once before starting xray, included in every VLESS request.
+var (
+	clientVersionMu sync.Mutex
+	clientVersion   string
+)
+
+// SetClientVersion stores the app version string to be sent in VLESS request addons.
+func SetClientVersion(version string) {
+	clientVersionMu.Lock()
+	defer clientVersionMu.Unlock()
+	clientVersion = version
+}
+
+// GetClientVersion returns the value most recently set by SetClientVersion.
+func GetClientVersion() string {
+	clientVersionMu.Lock()
+	defer clientVersionMu.Unlock()
+	return clientVersion
+}
+
+// CUSTOM-END: client-side VLESS session state
 
 var addrParser = protocol.NewAddressParser(
 	protocol.AddressFamilyByte(byte(protocol.AddressTypeIPv4), net.AddressFamilyIPv4),
@@ -197,6 +259,11 @@ func DecodeResponseHeader(reader io.Reader, request *protocol.RequestHeader) (*A
 	responseAddons, err := DecodeHeaderAddons(&buffer, reader)
 	if err != nil {
 		return nil, errors.New("failed to decode response header addons").Base(err)
+	}
+
+	// CUSTOM: notify gomobile client of server-confirmed auth (see SetAuthVerifiedCallback).
+	if responseAddons.AuthVerified {
+		fireAuthVerified()
 	}
 
 	return responseAddons, nil

@@ -42,6 +42,17 @@ func (c *DefaultDialerClient) IsClosed() bool {
 	return c.closed
 }
 
+// CUSTOM: CloseTransport actively tears down the underlying HTTP client's
+// idle connection pool (TLS state, persistent TCP sockets, HTTP/2 streams,
+// related goroutines). Go's GC doesn't release these promptly, so explicit
+// cleanup matters on memory-constrained platforms (iOS NetworkExtension 50MB).
+func (c *DefaultDialerClient) CloseTransport() {
+	c.closed = true
+	if c.client != nil {
+		c.client.CloseIdleConnections()
+	}
+}
+
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
 	// this is done when the TCP/UDP connection to the server was established,
 	// and we can unblock the Dial function and print correct net addresses in

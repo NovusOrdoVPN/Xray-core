@@ -14,6 +14,8 @@ const (
 	strategyLeastPing  string = "leastping"
 	strategyRoundRobin string = "roundrobin"
 	strategyLeastLoad  string = "leastload"
+	// CUSTOM: priority strategy (deterministic first-alive pick).
+	strategyPriority string = "priority"
 )
 
 var (
@@ -22,6 +24,8 @@ var (
 		strategyLeastPing:  func() interface{} { return new(strategyEmptyConfig) },
 		strategyRoundRobin: func() interface{} { return new(strategyEmptyConfig) },
 		strategyLeastLoad:  func() interface{} { return new(strategyLeastLoadConfig) },
+		// CUSTOM: priority uses no settings (empty config).
+		strategyPriority: func() interface{} { return new(strategyEmptyConfig) },
 	}, "type", "settings")
 )
 

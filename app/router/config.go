@@ -159,6 +159,14 @@ func (br *BalancingRule) Build(ohm outbound.Manager, dispatcher routing.Dispatch
 			fallbackTag: br.FallbackTag,
 			strategy:    &RandomStrategy{FallbackTag: br.FallbackTag},
 		}, nil
+	// CUSTOM: priority strategy — deterministic first-alive pick, used by gomobile client for Reality/Cloudflare failover.
+	case "priority":
+		return &Balancer{
+			selectors:   br.OutboundSelector,
+			ohm:         ohm,
+			fallbackTag: br.FallbackTag,
+			strategy:    &PriorityStrategy{FallbackTag: br.FallbackTag},
+		}, nil
 	default:
 		return nil, errors.New("unrecognized balancer type")
 	}

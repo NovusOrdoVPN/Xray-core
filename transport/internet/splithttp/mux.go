@@ -60,6 +60,46 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
 	return xmuxClient
 }
 
+// CUSTOM: closeXmuxConn tears down the underlying HTTP transport of an XmuxClient
+// if it supports CloseTransport (DefaultDialerClient does). Without this, removing
+// the XmuxClient from the slice just releases our reference — Go's GC doesn't close
+// the http.Client's connection pool promptly, leaving goroutines/TLS state/idle
+// sockets alive. Matters on iOS NetworkExtension (50MB limit).
+func closeXmuxConn(conn XmuxConn) {
+	if closer, ok := conn.(interface{ CloseTransport() }); ok {
+		closer.CloseTransport()
+	}
+}
+
+// CUSTOM: CleanupIdleClients removes expired/closed clients that have no active
+// streams and closes their HTTP transports. Returns true if any were removed.
+// Called by the periodic/lazy cleanup path in dialer.go.
+func (m *XmuxManager) CleanupIdleClients() bool {
+	cleaned := false
+	for i := 0; i < len(m.xmuxClients); {
+		client := m.xmuxClients[i]
+		expired := client.XmuxConn.IsClosed() ||
+			client.leftUsage == 0 ||
+			client.LeftRequests.Load() <= 0 ||
+			(client.UnreusableAt != time.Time{} && time.Now().After(client.UnreusableAt))
+
+		if expired && client.OpenUsage.Load() <= 0 {
+			closeXmuxConn(client.XmuxConn)
+			m.xmuxClients = append(m.xmuxClients[:i], m.xmuxClients[i+1:]...)
+			cleaned = true
+		} else {
+			i++
+		}
+	}
+	return cleaned
+}
+
+// CUSTOM: IsEmpty returns true when the manager holds no active clients.
+// Used by the global dialer map cleanup to decide when to drop a manager.
+func (m *XmuxManager) IsEmpty() bool {
+	return len(m.xmuxClients) == 0
+}
+
 func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when locking
 	for i := 0; i < len(m.xmuxClients); {
 		xmuxClient := m.xmuxClients[i]
@@ -72,6 +112,13 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 				", leftUsage = ", xmuxClient.leftUsage,
 				", LeftRequests = ", xmuxClient.LeftRequests.Load(),
 				", UnreusableAt = ", xmuxClient.UnreusableAt)
+			// CUSTOM: on mobile, actively close the transport when discarding a
+			// client with no active streams (see cleanup_mobile.go). No-op on
+			// desktop/server (see cleanup_desktop.go) — falls through to
+			// upstream's behavior of just dropping the client from the slice.
+			if xmuxClient.OpenUsage.Load() <= 0 {
+				maybeCloseOnDiscardXmux(xmuxClient.XmuxConn)
+			}
 			m.xmuxClients = append(m.xmuxClients[:i], m.xmuxClients[i+1:]...)
 		} else {
 			i++

@@ -270,8 +270,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	requestAddons := &encoding.Addons{
 		Flow: account.Flow,
+		// CUSTOM: normal-mode ClientVersion (set by gomobile client via encoding.SetClientVersion).
+		ClientVersion: encoding.GetClientVersion(),
 	}
-	// CUSTOM: propagate original client's version to exit server in relay mode.
+	// CUSTOM: relay mode forwards the ORIGINAL client's ClientVersion (from inbound.RelayClientVersion),
+	// overriding the local GetClientVersion() — only meaningful when the relay outbound is active.
 	if relayClientVersion != "" {
 		requestAddons.ClientVersion = relayClientVersion
 	}

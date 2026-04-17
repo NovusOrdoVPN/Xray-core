@@ -45,6 +45,43 @@ var (
 	globalDialerAccess sync.Mutex
 )
 
+// CUSTOM: cleanupGlobalDialerMapLocked walks the global XmuxManager map,
+// removes expired clients via each manager's CleanupIdleClients, and drops
+// empty managers. Must be called with globalDialerAccess held.
+//
+// Defined here (all platforms) but only ever CALLED from the mobile-only
+// hooks in cleanup_mobile.go. On desktop/server, this is dead code —
+// cleanup_desktop.go provides no-op shims so upstream's reactive-only
+// cleanup behavior is preserved.
+func cleanupGlobalDialerMapLocked() {
+	for key, manager := range globalDialerMap {
+		manager.CleanupIdleClients()
+		if manager.IsEmpty() {
+			delete(globalDialerMap, key)
+		}
+	}
+}
+
+// CUSTOM: periodicCleanupGlobalMap runs in a background goroutine (started
+// only on mobile builds via cleanup_mobile.go's init()) and sweeps the global
+// dialer map every 60 seconds. This complements the in-flight cleanup in
+// GetXmuxClient: when a VPN is connected but idle (no new Dial calls),
+// reactive cleanup alone can't reclaim the transport pool memory because
+// no code path touches the managers.
+//
+// mobileForceGC() is a runtime.GC() on mobile (cleanup_mobile.go) and a
+// no-op on desktop (cleanup_desktop.go) — but since this function only
+// runs on mobile, that's a formality.
+func periodicCleanupGlobalMap() {
+	ticker := time.NewTicker(60 * time.Second)
+	for range ticker.C {
+		globalDialerAccess.Lock()
+		cleanupGlobalDialerMapLocked()
+		globalDialerAccess.Unlock()
+		mobileForceGC()
+	}
+}
+
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
@@ -58,6 +95,11 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 	if globalDialerMap == nil {
 		globalDialerMap = make(map[dialerConf]*XmuxManager)
 	}
+
+	// CUSTOM: mobile-only lazy 30s sweep for bursty-Dial workloads. No-op on
+	// desktop/server (see cleanup_desktop.go). Mobile implementation lives in
+	// cleanup_mobile.go and throttles via lastCleanupTime declared there.
+	maybeLazyCleanup()
 
 	key := dialerConf{dest, streamSettings}
 
@@ -344,6 +386,10 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 func init() {
 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
+	// CUSTOM: the background cleanup goroutine (periodicCleanupGlobalMap)
+	// is started only on mobile builds — see init() in cleanup_mobile.go.
+	// Desktop/server builds rely on upstream's reactive cleanup (in
+	// GetXmuxClient) so behavior matches upstream exactly.
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
