@@ -1,0 +1,226 @@
+--- ./common/platform/platform.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/common/platform/platform.go	2026-02-12 01:03:06
+@@ -24,6 +24,8 @@
+ 	BrowserDialerAddress = "xray.browser.dialer"
+ 	XUDPLog              = "xray.xudp.show"
+ 	XUDPBaseKey          = "xray.xudp.basekey"
++
++	TunFdKey = "xray.tun.fd"
+ )
+ 
+ type EnvFlag struct {
+--- ./main/distro/debug/debug.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/main/distro/debug/debug.go	1970-01-01 04:00:00
+@@ -1,11 +0,0 @@
+-package debug
+-
+-import (
+-	"net/http"
+-)
+-
+-func init() {
+-	go func() {
+-		http.ListenAndServe(":6060", nil)
+-	}()
+-}
+--- ./proxy/wireguard/tun.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/wireguard/tun.go	2026-01-25 20:29:59
+@@ -174,7 +174,7 @@
+ 		})
+ 		stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
+ 
+-		udpForwarder := udp.NewForwarder(stack, func(r *udp.ForwarderRequest) {
++		udpForwarder := udp.NewForwarder(stack, func(r *udp.ForwarderRequest) bool {
+ 			go func(r *udp.ForwarderRequest) {
+ 				var (
+ 					wq waiter.Queue
+@@ -196,6 +196,7 @@
+ 
+ 				handler(xnet.UDPDestination(xnet.IPAddress(id.LocalAddress.AsSlice()), xnet.Port(id.LocalPort)), gonet.NewUDPConn(&wq, ep))
+ 			}(r)
++			return true
+ 		})
+ 		stack.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
+ 	}
+--- ./transport/internet/splithttp/client.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/transport/internet/splithttp/client.go	2026-02-26 22:29:17
+@@ -42,6 +42,13 @@
+ 	return c.closed
+ }
+ 
++// CloseTransport shuts down the underlying HTTP transport and releases
++// connection pool resources (goroutines, TLS state, buffers).
++func (c *DefaultDialerClient) CloseTransport() {
++	c.closed = true
++	c.client.CloseIdleConnections()
++}
++
+ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr gonet.Addr, err error) {
+ 	// this is done when the TCP/UDP connection to the server was established,
+ 	// and we can unblock the Dial function and print correct net addresses in
+--- ./transport/internet/splithttp/dialer.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/transport/internet/splithttp/dialer.go	2026-02-26 22:30:06
+@@ -13,6 +13,8 @@
+ 	"sync/atomic"
+ 	"time"
+ 
++	"runtime"
++
+ 	"github.com/quic-go/quic-go"
+ 	"github.com/quic-go/quic-go/http3"
+ 	"github.com/xtls/xray-core/common"
+@@ -38,7 +40,34 @@
+ var (
+ 	globalDialerMap    map[dialerConf]*XmuxManager
+ 	globalDialerAccess sync.Mutex
++	lastCleanupTime    time.Time
+ )
++
++// cleanupGlobalDialerMapLocked removes stale XmuxManagers from the global map.
++// Must be called with globalDialerAccess held.
++func cleanupGlobalDialerMapLocked() {
++	for key, manager := range globalDialerMap {
++		manager.CleanupIdleClients()
++		if manager.IsEmpty() {
++			delete(globalDialerMap, key)
++		}
++	}
++}
++
++// periodicCleanupGlobalMap runs every 60 seconds to clean up expired HTTP
++// transports and reclaim memory. This handles the case where no new Dial()
++// calls are made (e.g., VPN is connected but idle).
++func periodicCleanupGlobalMap() {
++	ticker := time.NewTicker(60 * time.Second)
++	for range ticker.C {
++		globalDialerAccess.Lock()
++		cleanupGlobalDialerMapLocked()
++		globalDialerAccess.Unlock()
++		// On memory-constrained platforms (iOS NetworkExtension, 50MB limit),
++		// nudge Go's GC to reclaim freed transport buffers promptly.
++		runtime.GC()
++	}
++}
+ 
+ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
+ 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+@@ -54,6 +83,14 @@
+ 		globalDialerMap = make(map[dialerConf]*XmuxManager)
+ 	}
+ 
++	// Lazy cleanup: every 30 seconds, sweep stale managers.
++	// This complements the periodic goroutine for the case where Dial()
++	// is called frequently (active VPN with many app connections).
++	if time.Since(lastCleanupTime) > 30*time.Second {
++		lastCleanupTime = time.Now()
++		cleanupGlobalDialerMapLocked()
++	}
++
+ 	key := dialerConf{dest, streamSettings}
+ 
+ 	xmuxManager, found := globalDialerMap[key]
+@@ -242,6 +279,7 @@
+ 
+ func init() {
+ 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
++	go periodicCleanupGlobalMap()
+ }
+ 
+ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
+--- ./transport/internet/splithttp/mux.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/transport/internet/splithttp/mux.go	2026-02-26 22:29:28
+@@ -60,6 +60,41 @@
+ 	return xmuxClient
+ }
+ 
++// closeXmuxConn closes the underlying HTTP transport of an XmuxClient,
++// releasing connection pool goroutines, TLS state, and buffers.
++func closeXmuxConn(conn XmuxConn) {
++	if closer, ok := conn.(interface{ CloseTransport() }); ok {
++		closer.CloseTransport()
++	}
++}
++
++// CleanupIdleClients removes expired/closed clients that have no active
++// streams and closes their HTTP transports. Returns true if any were removed.
++func (m *XmuxManager) CleanupIdleClients() bool {
++	cleaned := false
++	for i := 0; i < len(m.xmuxClients); {
++		client := m.xmuxClients[i]
++		expired := client.XmuxConn.IsClosed() ||
++			client.leftUsage == 0 ||
++			client.LeftRequests.Load() <= 0 ||
++			(client.UnreusableAt != time.Time{} && time.Now().After(client.UnreusableAt))
++
++		if expired && client.OpenUsage.Load() <= 0 {
++			closeXmuxConn(client.XmuxConn)
++			m.xmuxClients = append(m.xmuxClients[:i], m.xmuxClients[i+1:]...)
++			cleaned = true
++		} else {
++			i++
++		}
++	}
++	return cleaned
++}
++
++// IsEmpty returns true when the manager has no active clients.
++func (m *XmuxManager) IsEmpty() bool {
++	return len(m.xmuxClients) == 0
++}
++
+ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when locking
+ 	for i := 0; i < len(m.xmuxClients); {
+ 		xmuxClient := m.xmuxClients[i]
+@@ -72,6 +107,10 @@
+ 				", leftUsage = ", xmuxClient.leftUsage,
+ 				", LeftRequests = ", xmuxClient.LeftRequests.Load(),
+ 				", UnreusableAt = ", xmuxClient.UnreusableAt)
++			// Close transport if no active streams are using it
++			if xmuxClient.OpenUsage.Load() <= 0 {
++				closeXmuxConn(xmuxClient.XmuxConn)
++			}
+ 			m.xmuxClients = append(m.xmuxClients[:i], m.xmuxClients[i+1:]...)
+ 		} else {
+ 			i++
+--- ./common/buf/data/test_MultiBufferReadAllToByte.dat	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/common/buf/data/test_MultiBufferReadAllToByte.dat	1970-01-01 04:00:00
+@@ -1,39 +0,0 @@
+-
+-???8+?$??I????+??????+?+++?IO7$ZD88ZDMD8OZ$7II7+++++++++++++
+-+??7++???I????????+?+++?+I?IZI$OND7ODDDDDD7Z$IZI++++++++++++
+-???I????????????~,...~?++I?777$DD8O8DDD88O$O7$7I++++++++++?+
+-???????????????.,::~...,+?I77ZZD8ZDNDDDDD8ZZ7$$7+++++++?+?+?
+-??????????????.,,:~~~==,I?7$$ZOD8ODNDD8DDZ$87777++?+++?????+
+-?????????I?=...:~~~~=~=+I?$$ZODD88ND8N8DDOZOZ77?????++??????
+-???II?????.,,,:==~~===I?IIZ$O$88ODD8ODNDDDOO$7$??I?++?++++??
+-???I????+..,,~=+???+?????7OOZZ8O$$778DDDDDO87I$I++++++++????
+-I??????..,,:~=??????+=,~?ZZZ$$I??II$DDDDD8Z8I~,+=?II$777IIII
+-II???,.,,::~??I?I?....,,~==I?+===+?$ODN8DD$O=,......+?????II
+-I?I?..,,:~~????,...,,::::~~~~~~~~=+$88ODD88=~,,,.......IIIII
+-II,..,,:~~I?:..,,,::::~~~~~~~~~~~~~+IOZ87?~~~::::,,,,...=?II
+-I,...,:::....,:::::::~~~~~~~~~~~~~~~=++=~~~~~~~~~~~:::,,,?II
+-,,,,~....,,,::::::::::::::~~~~~~~~~~~~~~~~~~~~~~~~~~~::,,,??
+-:~:...,,,:::::::::::::::::::~~~~~~~~~~~~~~~~~~~~~~~~~~::,,II
+-:::::::::::::::::::~+++::::::~~~~~~~~~~~~~~~~~~~~~~~~::::,,7
+-::::::::::::::~IIII?????:::::::~~~~~~~~~~~~~~~~~~~~~::::::,I
+-:,,,,,,,:+ZIIIIIIIIIIIII:::~::~~~~~~~~~~~~~~~~~~~~=~::::::::
+-7I777IIZI7ZIIIIIIIIIIII7?:~~~~~~~~~~~~~~~~~~~~~~~~~=~:::::::
+-$$$77$7Z77$7I77IIII7III$$:~~~~~~~~~~~~~~~~~~~~~~~=II~:::::::
+-$$$8$Z7$7$Z777777777777Z7~:~~~~~~~~~~~~~~~~~~~~~~$777::::::,
+-ZOZOZOZZ$7$$ZZ$8DDDZ777$$=~~~~~~~~~~~~~~~~~~~~~~~$$$7~:::::,
+-OOZOOOZZOOZO$ZZZ$O$$$$7ZZ$~~~~~~~~~~~~~~~~~~~~~~~ZZ$ZZ:::::,
+-O88OOOOO8ODOZZZZZOOZ8OOOOO:~~~~~~~~~~~~~~~~~~~~~ZOZZZZ~:::::
+-8888O8OODZ8ZOZOZZOOZOOOOOZ:::~~~~~~~~~~~~~~~~~~~,Z$ZOOO:::::
+-Z88O88D8Z88ZZOOZZOZ$$Z$$OZ:::~~~~~~~~~~~~~~~~~~~,,ZOOOOO::::
+-888D88OODD8DNDNDNNDDDD88OI:::::~~~~~~~~~~~~~~~~~.,:8ZO8O::::
+-D8D88DO88ZOOZOO8DDDNOZ$$O8~::::~~~~~~~~~~~~~===~..,88O8OO:::
+-8OD8O8OODO$D8DO88DO8O8888O~~::~~::~~~~~~~~~~~===...:8OOOZ~::
+-:..................,~,..~,~~:~:~~~~~~~~~~~~~~===...,+.....~~
+-.........................~~~:~~~~~~~~~~~~~~~~~==:..,......:~
+-.Made with love.........,~~~~~~~~:~~~~::~~~~~~~==..,,......:
+-........................~~~~~~~~~~~~~~:~~~~~~~~===,.,......~
+-...................,,..~~~~~~~~~~~~~~~~~~~~~~~~~==~,,.......
+-..................,,::~~~~~~~~~~~~~~~~~~~~~~~~~====~.,....,.
+-....................:~~~~~~~~~~~~~~~~~~~~~~~~~~~~==~:......,
+-......................,~================,.==~~~=~===~,......
+-.Thank you for your support.....................:~=,,,,,,,..

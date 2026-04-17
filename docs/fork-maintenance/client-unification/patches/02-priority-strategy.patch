@@ -1,0 +1,179 @@
+--- ./app/router/config.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/app/router/config.go	2026-04-10 14:16:48
+@@ -146,6 +146,13 @@
+ 			fallbackTag: br.FallbackTag,
+ 			strategy:    leastLoadStrategy,
+ 		}, nil
++	case "priority":
++		return &Balancer{
++			selectors:   br.OutboundSelector,
++			strategy:    &PriorityStrategy{FallbackTag: br.FallbackTag},
++			fallbackTag: br.FallbackTag,
++			ohm:         ohm,
++		}, nil
+ 	case "random":
+ 		fallthrough
+ 	case "":
+--- ./app/router/strategy_priority.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/app/router/strategy_priority.go	2026-04-10 20:02:23
+@@ -0,0 +1,131 @@
++package router
++
++import (
++	"context"
++	"sync"
++
++	"github.com/xtls/xray-core/app/observatory"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/features/extension"
++)
++
++// RouteChangeCallback is called when PriorityStrategy switches to a different outbound.
++// The argument is the new outbound tag (e.g., "direct-00" or "relay-00").
++var (
++	routeChangeMu       sync.Mutex
++	routeChangeCallback func(tag string)
++)
++
++// SetRouteChangeCallback registers a callback that fires when the active
++// outbound changes. Call with nil to unregister.
++func SetRouteChangeCallback(cb func(tag string)) {
++	routeChangeMu.Lock()
++	routeChangeCallback = cb
++	routeChangeMu.Unlock()
++}
++
++// ClearRouteChangeCallback unregisters the route change callback.
++// Called on xray stop to prevent stale notifications.
++func ClearRouteChangeCallback() {
++	routeChangeMu.Lock()
++	routeChangeCallback = nil
++	routeChangeMu.Unlock()
++}
++
++// PriorityStrategy picks the first alive outbound in sorted order.
++// Tags like "direct-0", "direct-1", "relay-0" are tried in that order.
++// Alive outbounds are preferred over unknown (not yet probed).
++type PriorityStrategy struct {
++	FallbackTag string
++
++	ctx         context.Context
++	observatory extension.Observatory
++
++	mu         sync.Mutex
++	lastPicked string
++}
++
++func (s *PriorityStrategy) InjectContext(ctx context.Context) {
++	s.ctx = ctx
++	common.Must(core.RequireFeatures(s.ctx, func(obs extension.Observatory) error {
++		s.observatory = obs
++		return nil
++	}))
++}
++
++// Note on common.Must safety: RequireFeatures registers the callback and returns nil.
++// If no observatory is configured, the callback simply never fires and s.observatory
++// stays nil. PickOutbound handles nil observatory by picking the first candidate.
++
++func (s *PriorityStrategy) GetPrincipleTarget(candidates []string) []string {
++	if picked := s.PickOutbound(candidates); picked != "" {
++		return []string{picked}
++	}
++	return candidates
++}
++
++func (s *PriorityStrategy) PickOutbound(candidates []string) string {
++	if s.observatory == nil {
++		if len(candidates) > 0 {
++			return candidates[0]
++		}
++		return ""
++	}
++
++	observeReport, err := s.observatory.GetObservation(s.ctx)
++	if err != nil {
++		if len(candidates) > 0 {
++			return candidates[0]
++		}
++		return ""
++	}
++
++	statusMap := make(map[string]*observatory.OutboundStatus)
++	if result, ok := observeReport.(*observatory.ObservationResult); ok {
++		for _, st := range result.Status {
++			statusMap[st.OutboundTag] = st
++		}
++	}
++
++	// Phase 1: First ALIVE outbound (verified working, in priority order).
++	// Since candidates are sorted alphabetically, direct-00 < direct-01 < relay-00,
++	// so direct is always preferred over relay when both are alive.
++	for _, c := range candidates {
++		if st, found := statusMap[c]; found && st.Alive {
++			s.notifyIfChanged(c)
++			return c
++		}
++	}
++
++	// Phase 2: First UNKNOWN outbound (not yet probed — optimistic).
++	// Only reached on cold start when no probes have completed yet.
++	for _, c := range candidates {
++		if _, found := statusMap[c]; !found {
++			return c
++		}
++	}
++
++	// Phase 3: All dead → empty → triggers fallbackTag
++	return ""
++}
++
++func (s *PriorityStrategy) notifyIfChanged(tag string) {
++	if tag == "" {
++		return
++	}
++	s.mu.Lock()
++	if tag == s.lastPicked {
++		s.mu.Unlock()
++		return
++	}
++	s.lastPicked = tag
++	s.mu.Unlock()
++
++	routeChangeMu.Lock()
++	cb := routeChangeCallback
++	routeChangeMu.Unlock()
++	if cb != nil {
++		cb(tag)
++	}
++}
+--- ./infra/conf/router.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/router.go	2026-04-10 14:41:09
+@@ -40,7 +40,7 @@
+ 	switch r.Strategy.Type {
+ 	case "":
+ 		r.Strategy.Type = strategyRandom
+-	case strategyRandom, strategyLeastLoad, strategyLeastPing, strategyRoundRobin:
++	case strategyRandom, strategyLeastLoad, strategyLeastPing, strategyRoundRobin, strategyPriority:
+ 	default:
+ 		return nil, errors.New("unknown balancing strategy: " + r.Strategy.Type)
+ 	}
+--- ./infra/conf/router_strategy.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/router_strategy.go	2026-04-10 14:17:00
+@@ -14,6 +14,7 @@
+ 	strategyLeastPing  string = "leastping"
+ 	strategyRoundRobin string = "roundrobin"
+ 	strategyLeastLoad  string = "leastload"
++	strategyPriority   string = "priority"
+ )
+ 
+ var (
+@@ -22,6 +23,7 @@
+ 		strategyLeastPing:  func() interface{} { return new(strategyEmptyConfig) },
+ 		strategyRoundRobin: func() interface{} { return new(strategyEmptyConfig) },
+ 		strategyLeastLoad:  func() interface{} { return new(strategyLeastLoadConfig) },
++		strategyPriority:   func() interface{} { return new(strategyEmptyConfig) },
+ 	}, "type", "settings")
+ )
+ 

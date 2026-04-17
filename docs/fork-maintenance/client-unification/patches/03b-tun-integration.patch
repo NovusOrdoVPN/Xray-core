@@ -1,0 +1,74 @@
+--- infra/conf/tun.go ---
+(pristine missing — new file)
+package conf
+
+import (
+	"github.com/xtls/xray-core/proxy/tun"
+	"google.golang.org/protobuf/proto"
+--- infra/conf/xray.go ---
+--- v25.12.2-pristine/infra/conf/xray.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/xray.go	2026-02-12 01:03:25
+@@ -30,6 +30,7 @@
+ 		"vmess":         func() interface{} { return new(VMessInboundConfig) },
+ 		"trojan":        func() interface{} { return new(TrojanServerConfig) },
+ 		"wireguard":     func() interface{} { return &WireGuardConfig{IsClient: false} },
++		"tun":           func() interface{} { return new(TunConfig) },
+ 	}, "protocol", "settings")
+ 
+ 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
+@@ -133,7 +134,10 @@
+ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
+ 	receiverSettings := &proxyman.ReceiverConfig{}
+ 
+-	if c.ListenOn == nil {
++	if strings.EqualFold(c.Protocol, "tun") {
++		// TUN inbound doesn't need port configuration — it uses a network
++		// interface (or fd) instead of binding to a port.
++	} else if c.ListenOn == nil {
+ 		// Listen on anyip, must set PortList
+ 		if c.PortList == nil {
+ 			return nil, errors.New("Listen on AnyIP but no Port(s) set in InboundDetour.")
+--- main/distro/all/all.go ---
+--- v25.12.2-pristine/main/distro/all/all.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/main/distro/all/all.go	2026-02-12 01:03:07
+@@ -47,6 +47,7 @@
+ 	_ "github.com/xtls/xray-core/proxy/vless/outbound"
+ 	_ "github.com/xtls/xray-core/proxy/vmess/inbound"
+ 	_ "github.com/xtls/xray-core/proxy/vmess/outbound"
++	_ "github.com/xtls/xray-core/proxy/tun"
+ 	_ "github.com/xtls/xray-core/proxy/wireguard"
+ 
+ 	// Transports
+--- app/proxyman/inbound/always.go ---
+--- v25.12.2-pristine/app/proxyman/inbound/always.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/app/proxyman/inbound/always.go	2026-02-12 01:03:47
+@@ -9,6 +9,7 @@
+ 	"github.com/xtls/xray-core/common/mux"
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/serial"
++	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/policy"
+ 	"github.com/xtls/xray-core/features/stats"
+@@ -52,6 +53,21 @@
+ }
+ 
+ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *proxyman.ReceiverConfig, proxyConfig interface{}) (*AlwaysOnInboundHandler, error) {
++	// Inject tag and sniffing config into context before creating proxy.
++	// Proxies like TUN read these from context during Init().
++	ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: tag})
++	if receiverConfig.SniffingSettings != nil {
++		ctx = session.ContextWithContent(ctx, &session.Content{
++			SniffingRequest: session.SniffingRequest{
++				Enabled:                        receiverConfig.SniffingSettings.Enabled,
++				OverrideDestinationForProtocol: receiverConfig.SniffingSettings.DestinationOverride,
++				ExcludeForDomain:               receiverConfig.SniffingSettings.DomainsExcluded,
++				MetadataOnly:                   receiverConfig.SniffingSettings.MetadataOnly,
++				RouteOnly:                      receiverConfig.SniffingSettings.RouteOnly,
++			},
++		})
++	}
++
+ 	rawProxy, err := common.CreateObject(ctx, proxyConfig)
+ 	if err != nil {
+ 		return nil, err

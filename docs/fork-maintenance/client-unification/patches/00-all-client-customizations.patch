@@ -1,0 +1,2727 @@
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/app/proxyman/inbound/always.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/app/proxyman/inbound/always.go
+--- v25.12.2-pristine/app/proxyman/inbound/always.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/app/proxyman/inbound/always.go	2026-02-12 01:03:47
+@@ -9,6 +9,7 @@
+ 	"github.com/xtls/xray-core/common/mux"
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/serial"
++	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/policy"
+ 	"github.com/xtls/xray-core/features/stats"
+@@ -52,6 +53,21 @@
+ }
+ 
+ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *proxyman.ReceiverConfig, proxyConfig interface{}) (*AlwaysOnInboundHandler, error) {
++	// Inject tag and sniffing config into context before creating proxy.
++	// Proxies like TUN read these from context during Init().
++	ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: tag})
++	if receiverConfig.SniffingSettings != nil {
++		ctx = session.ContextWithContent(ctx, &session.Content{
++			SniffingRequest: session.SniffingRequest{
++				Enabled:                        receiverConfig.SniffingSettings.Enabled,
++				OverrideDestinationForProtocol: receiverConfig.SniffingSettings.DestinationOverride,
++				ExcludeForDomain:               receiverConfig.SniffingSettings.DomainsExcluded,
++				MetadataOnly:                   receiverConfig.SniffingSettings.MetadataOnly,
++				RouteOnly:                      receiverConfig.SniffingSettings.RouteOnly,
++			},
++		})
++	}
++
+ 	rawProxy, err := common.CreateObject(ctx, proxyConfig)
+ 	if err != nil {
+ 		return nil, err
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/app/router/config.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/app/router/config.go
+--- v25.12.2-pristine/app/router/config.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/app/router/config.go	2026-04-10 14:16:48
+@@ -146,6 +146,13 @@
+ 			fallbackTag: br.FallbackTag,
+ 			strategy:    leastLoadStrategy,
+ 		}, nil
++	case "priority":
++		return &Balancer{
++			selectors:   br.OutboundSelector,
++			strategy:    &PriorityStrategy{FallbackTag: br.FallbackTag},
++			fallbackTag: br.FallbackTag,
++			ohm:         ohm,
++		}, nil
+ 	case "random":
+ 		fallthrough
+ 	case "":
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/app/router/strategy_priority.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/app/router/strategy_priority.go
+--- v25.12.2-pristine/app/router/strategy_priority.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/app/router/strategy_priority.go	2026-04-10 20:02:23
+@@ -0,0 +1,131 @@
++package router
++
++import (
++	"context"
++	"sync"
++
++	"github.com/xtls/xray-core/app/observatory"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/features/extension"
++)
++
++// RouteChangeCallback is called when PriorityStrategy switches to a different outbound.
++// The argument is the new outbound tag (e.g., "direct-00" or "relay-00").
++var (
++	routeChangeMu       sync.Mutex
++	routeChangeCallback func(tag string)
++)
++
++// SetRouteChangeCallback registers a callback that fires when the active
++// outbound changes. Call with nil to unregister.
++func SetRouteChangeCallback(cb func(tag string)) {
++	routeChangeMu.Lock()
++	routeChangeCallback = cb
++	routeChangeMu.Unlock()
++}
++
++// ClearRouteChangeCallback unregisters the route change callback.
++// Called on xray stop to prevent stale notifications.
++func ClearRouteChangeCallback() {
++	routeChangeMu.Lock()
++	routeChangeCallback = nil
++	routeChangeMu.Unlock()
++}
++
++// PriorityStrategy picks the first alive outbound in sorted order.
++// Tags like "direct-0", "direct-1", "relay-0" are tried in that order.
++// Alive outbounds are preferred over unknown (not yet probed).
++type PriorityStrategy struct {
++	FallbackTag string
++
++	ctx         context.Context
++	observatory extension.Observatory
++
++	mu         sync.Mutex
++	lastPicked string
++}
++
++func (s *PriorityStrategy) InjectContext(ctx context.Context) {
++	s.ctx = ctx
++	common.Must(core.RequireFeatures(s.ctx, func(obs extension.Observatory) error {
++		s.observatory = obs
++		return nil
++	}))
++}
++
++// Note on common.Must safety: RequireFeatures registers the callback and returns nil.
++// If no observatory is configured, the callback simply never fires and s.observatory
++// stays nil. PickOutbound handles nil observatory by picking the first candidate.
++
++func (s *PriorityStrategy) GetPrincipleTarget(candidates []string) []string {
++	if picked := s.PickOutbound(candidates); picked != "" {
++		return []string{picked}
++	}
++	return candidates
++}
++
++func (s *PriorityStrategy) PickOutbound(candidates []string) string {
++	if s.observatory == nil {
++		if len(candidates) > 0 {
++			return candidates[0]
++		}
++		return ""
++	}
++
++	observeReport, err := s.observatory.GetObservation(s.ctx)
++	if err != nil {
++		if len(candidates) > 0 {
++			return candidates[0]
++		}
++		return ""
++	}
++
++	statusMap := make(map[string]*observatory.OutboundStatus)
++	if result, ok := observeReport.(*observatory.ObservationResult); ok {
++		for _, st := range result.Status {
++			statusMap[st.OutboundTag] = st
++		}
++	}
++
++	// Phase 1: First ALIVE outbound (verified working, in priority order).
++	// Since candidates are sorted alphabetically, direct-00 < direct-01 < relay-00,
++	// so direct is always preferred over relay when both are alive.
++	for _, c := range candidates {
++		if st, found := statusMap[c]; found && st.Alive {
++			s.notifyIfChanged(c)
++			return c
++		}
++	}
++
++	// Phase 2: First UNKNOWN outbound (not yet probed — optimistic).
++	// Only reached on cold start when no probes have completed yet.
++	for _, c := range candidates {
++		if _, found := statusMap[c]; !found {
++			return c
++		}
++	}
++
++	// Phase 3: All dead → empty → triggers fallbackTag
++	return ""
++}
++
++func (s *PriorityStrategy) notifyIfChanged(tag string) {
++	if tag == "" {
++		return
++	}
++	s.mu.Lock()
++	if tag == s.lastPicked {
++		s.mu.Unlock()
++		return
++	}
++	s.lastPicked = tag
++	s.mu.Unlock()
++
++	routeChangeMu.Lock()
++	cb := routeChangeCallback
++	routeChangeMu.Unlock()
++	if cb != nil {
++		cb(tag)
++	}
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/common/buf/data/test_MultiBufferReadAllToByte.dat /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/common/buf/data/test_MultiBufferReadAllToByte.dat
+--- v25.12.2-pristine/common/buf/data/test_MultiBufferReadAllToByte.dat	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/common/buf/data/test_MultiBufferReadAllToByte.dat	1970-01-01 04:00:00
+@@ -1,39 +0,0 @@
+-
+-???8+?$??I????+??????+?+++?IO7$ZD88ZDMD8OZ$7II7+++++++++++++
+-+??7++???I????????+?+++?+I?IZI$OND7ODDDDDD7Z$IZI++++++++++++
+-???I????????????~,...~?++I?777$DD8O8DDD88O$O7$7I++++++++++?+
+-???????????????.,::~...,+?I77ZZD8ZDNDDDDD8ZZ7$$7+++++++?+?+?
+-??????????????.,,:~~~==,I?7$$ZOD8ODNDD8DDZ$87777++?+++?????+
+-?????????I?=...:~~~~=~=+I?$$ZODD88ND8N8DDOZOZ77?????++??????
+-???II?????.,,,:==~~===I?IIZ$O$88ODD8ODNDDDOO$7$??I?++?++++??
+-???I????+..,,~=+???+?????7OOZZ8O$$778DDDDDO87I$I++++++++????
+-I??????..,,:~=??????+=,~?ZZZ$$I??II$DDDDD8Z8I~,+=?II$777IIII
+-II???,.,,::~??I?I?....,,~==I?+===+?$ODN8DD$O=,......+?????II
+-I?I?..,,:~~????,...,,::::~~~~~~~~=+$88ODD88=~,,,.......IIIII
+-II,..,,:~~I?:..,,,::::~~~~~~~~~~~~~+IOZ87?~~~::::,,,,...=?II
+-I,...,:::....,:::::::~~~~~~~~~~~~~~~=++=~~~~~~~~~~~:::,,,?II
+-,,,,~....,,,::::::::::::::~~~~~~~~~~~~~~~~~~~~~~~~~~~::,,,??
+-:~:...,,,:::::::::::::::::::~~~~~~~~~~~~~~~~~~~~~~~~~~::,,II
+-:::::::::::::::::::~+++::::::~~~~~~~~~~~~~~~~~~~~~~~~::::,,7
+-::::::::::::::~IIII?????:::::::~~~~~~~~~~~~~~~~~~~~~::::::,I
+-:,,,,,,,:+ZIIIIIIIIIIIII:::~::~~~~~~~~~~~~~~~~~~~~=~::::::::
+-7I777IIZI7ZIIIIIIIIIIII7?:~~~~~~~~~~~~~~~~~~~~~~~~~=~:::::::
+-$$$77$7Z77$7I77IIII7III$$:~~~~~~~~~~~~~~~~~~~~~~~=II~:::::::
+-$$$8$Z7$7$Z777777777777Z7~:~~~~~~~~~~~~~~~~~~~~~~$777::::::,
+-ZOZOZOZZ$7$$ZZ$8DDDZ777$$=~~~~~~~~~~~~~~~~~~~~~~~$$$7~:::::,
+-OOZOOOZZOOZO$ZZZ$O$$$$7ZZ$~~~~~~~~~~~~~~~~~~~~~~~ZZ$ZZ:::::,
+-O88OOOOO8ODOZZZZZOOZ8OOOOO:~~~~~~~~~~~~~~~~~~~~~ZOZZZZ~:::::
+-8888O8OODZ8ZOZOZZOOZOOOOOZ:::~~~~~~~~~~~~~~~~~~~,Z$ZOOO:::::
+-Z88O88D8Z88ZZOOZZOZ$$Z$$OZ:::~~~~~~~~~~~~~~~~~~~,,ZOOOOO::::
+-888D88OODD8DNDNDNNDDDD88OI:::::~~~~~~~~~~~~~~~~~.,:8ZO8O::::
+-D8D88DO88ZOOZOO8DDDNOZ$$O8~::::~~~~~~~~~~~~~===~..,88O8OO:::
+-8OD8O8OODO$D8DO88DO8O8888O~~::~~::~~~~~~~~~~~===...:8OOOZ~::
+-:..................,~,..~,~~:~:~~~~~~~~~~~~~~===...,+.....~~
+-.........................~~~:~~~~~~~~~~~~~~~~~==:..,......:~
+-.Made with love.........,~~~~~~~~:~~~~::~~~~~~~==..,,......:
+-........................~~~~~~~~~~~~~~:~~~~~~~~===,.,......~
+-...................,,..~~~~~~~~~~~~~~~~~~~~~~~~~==~,,.......
+-..................,,::~~~~~~~~~~~~~~~~~~~~~~~~~====~.,....,.
+-....................:~~~~~~~~~~~~~~~~~~~~~~~~~~~~==~:......,
+-......................,~================,.==~~~=~===~,......
+-.Thank you for your support.....................:~=,,,,,,,..
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/common/platform/platform.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/common/platform/platform.go
+--- v25.12.2-pristine/common/platform/platform.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/common/platform/platform.go	2026-02-12 01:03:06
+@@ -24,6 +24,8 @@
+ 	BrowserDialerAddress = "xray.browser.dialer"
+ 	XUDPLog              = "xray.xudp.show"
+ 	XUDPBaseKey          = "xray.xudp.basekey"
++
++	TunFdKey = "xray.tun.fd"
+ )
+ 
+ type EnvFlag struct {
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/infra/conf/router.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/router.go
+--- v25.12.2-pristine/infra/conf/router.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/router.go	2026-04-10 14:41:09
+@@ -40,7 +40,7 @@
+ 	switch r.Strategy.Type {
+ 	case "":
+ 		r.Strategy.Type = strategyRandom
+-	case strategyRandom, strategyLeastLoad, strategyLeastPing, strategyRoundRobin:
++	case strategyRandom, strategyLeastLoad, strategyLeastPing, strategyRoundRobin, strategyPriority:
+ 	default:
+ 		return nil, errors.New("unknown balancing strategy: " + r.Strategy.Type)
+ 	}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/infra/conf/router_strategy.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/router_strategy.go
+--- v25.12.2-pristine/infra/conf/router_strategy.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/router_strategy.go	2026-04-10 14:17:00
+@@ -14,6 +14,7 @@
+ 	strategyLeastPing  string = "leastping"
+ 	strategyRoundRobin string = "roundrobin"
+ 	strategyLeastLoad  string = "leastload"
++	strategyPriority   string = "priority"
+ )
+ 
+ var (
+@@ -22,6 +23,7 @@
+ 		strategyLeastPing:  func() interface{} { return new(strategyEmptyConfig) },
+ 		strategyRoundRobin: func() interface{} { return new(strategyEmptyConfig) },
+ 		strategyLeastLoad:  func() interface{} { return new(strategyLeastLoadConfig) },
++		strategyPriority:   func() interface{} { return new(strategyEmptyConfig) },
+ 	}, "type", "settings")
+ )
+ 
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/infra/conf/tun.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/tun.go
+--- v25.12.2-pristine/infra/conf/tun.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/tun.go	2026-02-12 01:03:26
+@@ -0,0 +1,30 @@
++package conf
++
++import (
++	"github.com/xtls/xray-core/proxy/tun"
++	"google.golang.org/protobuf/proto"
++)
++
++type TunConfig struct {
++	Name      string `json:"name"`
++	MTU       uint32 `json:"MTU"`
++	UserLevel uint32 `json:"userLevel"`
++}
++
++func (v *TunConfig) Build() (proto.Message, error) {
++	config := &tun.Config{
++		Name:      v.Name,
++		MTU:       v.MTU,
++		UserLevel: v.UserLevel,
++	}
++
++	if v.Name == "" {
++		config.Name = "xray0"
++	}
++
++	if v.MTU == 0 {
++		config.MTU = 1500
++	}
++
++	return config, nil
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/infra/conf/xray.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/xray.go
+--- v25.12.2-pristine/infra/conf/xray.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/infra/conf/xray.go	2026-02-12 01:03:25
+@@ -30,6 +30,7 @@
+ 		"vmess":         func() interface{} { return new(VMessInboundConfig) },
+ 		"trojan":        func() interface{} { return new(TrojanServerConfig) },
+ 		"wireguard":     func() interface{} { return &WireGuardConfig{IsClient: false} },
++		"tun":           func() interface{} { return new(TunConfig) },
+ 	}, "protocol", "settings")
+ 
+ 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
+@@ -133,7 +134,10 @@
+ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
+ 	receiverSettings := &proxyman.ReceiverConfig{}
+ 
+-	if c.ListenOn == nil {
++	if strings.EqualFold(c.Protocol, "tun") {
++		// TUN inbound doesn't need port configuration — it uses a network
++		// interface (or fd) instead of binding to a port.
++	} else if c.ListenOn == nil {
+ 		// Listen on anyip, must set PortList
+ 		if c.PortList == nil {
+ 			return nil, errors.New("Listen on AnyIP but no Port(s) set in InboundDetour.")
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/main/distro/all/all.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/main/distro/all/all.go
+--- v25.12.2-pristine/main/distro/all/all.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/main/distro/all/all.go	2026-02-12 01:03:07
+@@ -47,6 +47,7 @@
+ 	_ "github.com/xtls/xray-core/proxy/vless/outbound"
+ 	_ "github.com/xtls/xray-core/proxy/vmess/inbound"
+ 	_ "github.com/xtls/xray-core/proxy/vmess/outbound"
++	_ "github.com/xtls/xray-core/proxy/tun"
+ 	_ "github.com/xtls/xray-core/proxy/wireguard"
+ 
+ 	// Transports
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/main/distro/debug/debug.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/main/distro/debug/debug.go
+--- v25.12.2-pristine/main/distro/debug/debug.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/main/distro/debug/debug.go	1970-01-01 04:00:00
+@@ -1,11 +0,0 @@
+-package debug
+-
+-import (
+-	"net/http"
+-)
+-
+-func init() {
+-	go func() {
+-		http.ListenAndServe(":6060", nil)
+-	}()
+-}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/README.md /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/README.md
+--- v25.12.2-pristine/proxy/tun/README.md	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/README.md	2026-02-12 00:57:17
+@@ -0,0 +1,232 @@
++# TUN network layer 3 input support
++
++TUN interface support bridges the gap between network layer 3 and layer 7, introducing raw network input.
++
++This functionality is targeted to assist applications/end devices that don't have proxy support, or can't run external applications (like Smart TV's). Making it possible to run Xray proxy right on network edge devices (routers) with support to route raw network traffic. \
++Primary targets are Linux based router devices. Like most popular OpenWRT option. \
++Support for Windows, macOS, Android and iOS is also implemented (see below).
++
++## PLEASE READ FOLLOWING CAREFULLY
++
++If you are not sure what this is and do you need it or not - you don't. \
++This functionality is intended to be configured by network professionals, who understand the deployment case and scenarios. \
++Plainly enabling it in the config probably will result nothing, or lock your router up in infinite network loop.
++
++## DETAILS
++
++Current implementation does not contain options to configure network level addresses, routing or rules.
++Enabling the feature will result only tun interface up, and that's it. \
++This is explicit decision, significantly simplifying implementation, and allowing any number of custom configurations, consumers could come up with. Network interface is OS level entity, and OS is what should manage it. \
++Working configuration, is tun enabled in Xray config with specific name (e.g. xray0), and OS level configuration to manage "xray0" interface, applying routing and rules on interface up.
++This way consistency of system level routing and rules is ensured from single place of responsibility - the OS itself. \
++Examples of how to achieve this on a simple Linux system (Ubuntu with systemd-networkd) can be found at the end of this README.
++
++Due to this inbound not actually being a proxy, the configuration ignore required listen and port options, and never listen on any port. \
++Here is simple Xray config snippet to enable the inbound:
++```
++{
++  "inbounds": [
++    {
++      "port": 0,
++      "protocol": "tun",
++      "settings": {
++        "name": "xray0",
++        "MTU": 1492
++      }
++    }
++  ],
++```
++
++## SUPPORTED FEATURES
++
++- IPv4 and IPv6
++- TCP and UDP
++
++## LIMITATION
++
++- No ICMP support
++- Connections are established to any host, as connection success is only a mark of successful accepting packet for proxying. Hosts that are not accepting connections or don't even exists, will look like they opened a connection (SYN-ACK), and never send back a single byte, closing connection (RST) after some time. This is the side effect of the whole process actually being a proxy, and not real network layer 3 vpn
++
++## CONSIDERATIONS
++
++This feature being network level interface that require raw routing, bring some ambiguities that need to be taken in account. \
++Xray-core itself is connecting to its uplinks on a network level, therefore, it's really simple to lock network up in an infinite loop, when trying to pass "everything through Xray". \
++You can't just route 0.0.0.0/0 through xray0 interface, as that will result Xray-core itself try to reach its uplink through xray0 interface, resulting infinite network loop.
++There are several ways to address this:
++
++- Approach 1: \
++  Add precise static route to Xray upstreams, having them always routed through static internet gateway.
++  E.g. when 123.123.123.123 is the Xray VLESS uplink, this network configuration will work just fine:
++  ```
++  ip route add 123.123.123.123/32 via <provider internet gateway ip>
++  ip route add 0.0.0.0/0 dev xray0
++  ```
++  This has disadvantages, - a lot of conditions must be kept static: internet gateway address, xray uplink ip address, and so on.
++- Approach 1-b: \
++  Route only specific networks through Xray, keeping the default gateway unchanged.
++  This can be done in many different ways, using ip sets, routing daemons like BGP peers, etc... All you need to do is to route the paths through xray0 dev.
++  The disadvantage in this case is smaller, - you need to make sure the uplink will not become part of those sets and that's it. Can easily be done with route metric priorities.
++- Approach 2: \
++  Separate main route table and Xray route table with default gateways pointing to different destinations.
++  This way you can achieve full protection of hosts behind the router, keeping router configuration as flexible as desired. \
++  There are two ways to do that: \
++  Either configure xray0 interface to appear and operate as default gateway in a separate route table, e.g. 1001. Then mark and route protected traffic by ip rules to that table. \
++  It's a simplest way to make a "non-damaging" configuration, when the only thing you need to do to enable/disable proxying is to flip the ip rules off. Which is also a disadvantage of itself - if by accident ip rules will get disabled, the traffic will spill out of the internet interface unprotected. \
++  Or, other way around, move default routing to a separate route table, so that all usual routing information is set in e.g. route table 1000,
++  and Xray interface operate in the main route table. This will allow proper flexibility, but you need to ensure traffic from the Xray process, running on the router, is marked to get routed through table 1000. This again can be achieved in same ways, using ip rules and iptable rules combinations. \
++  Big advantage of that, is that traffic of the route itself is going to be wrapped into the proxy, including DNS queries, without any additional effort. Although, the disadvantage of that is, that in any case proxying stops (uplink dies, Xray hangs, encryption start to flap), it will result complete internet inaccessibility. \
++  Any approach is applicable, and if you know what you are doing (which is expected, if you read until here) you do understand which one you want and can manage. \
++
++### Important:
++
++TUN is network level entity, therefore communication through it, is always ip to ip, there are no host names. \
++Therefore, DNS resolution will always happen before traffic even enter the interface (it will be separate ip-to-ip packets/connections to resolve hostnames). \
++You always need to consider that DNS queries in any configuration you chose, most likely, will originate from the router itself (hosts behind the router access router DNS, router DNS fire queries to the outside).
++Without proper addressing that, DNS queries will expose actual destinations/websites accessed through the router. \
++To address that you can as ignore (not use) DNS of the router (just delegate some public DNS in DHCP configuration to your devices), or make sure routing rules are configured the way, DNS resolution of the router itself runs through Xray interface/routing table.
++
++You also need to remember that local traffic of the router (e.g. DNS, firmware updates, etc.), is subject of firewall rules as outcoming/incoming traffic (not forward).
++If you have restrictive firewall, you need to allow input/output traffic through xray0 interface, for it to properly dispatch and reach the OS back.
++
++Additionally, working with two route tables is not taken lightly by Linux, and sometimes make it panic about "martian packets", which it calls the packets arriving through interfaces it does not expect they could arrive from. \
++It was just a warning until recent kernel versions, but now traffic is often dropped. \
++In simple case this can be just disabled with
++```
++/usr/sbin/sysctl -w net.ipv4.conf.all.rp_filter=0
++```
++But proper approach should be defining your route tables fully and consistently, adding all routes corresponding to traffic that flow through them.
++
++## EXAMPLES
++
++systemd-networkd \
++configuration file you can place in /etc/systemd/networkd as 90-xray0.network
++which will configure xray0 interface and routing using route table 1001, when the interface will appear in the system (Xray starts). And deconfigure when disappears.
++```
++[Match]
++Name = xray0
++
++[Network]
++KeepConfiguration = yes
++
++[Link]
++ActivationPolicy = manual
++RequiredForOnline = no
++
++[Route]
++Table = 1001
++Destination = 0.0.0.0/0
++
++[RoutingPolicyRule]
++From = 192.168.0.0/24
++Table = 1001
++```
++RoutingPolicyRule will add the record into ip rules, that will funnel all traffic from 192.168.0.0/24 through the table 1001 \
++Please note that for ideal configuration of the routing you will also need to add the route to 192.168.0.0/24 to the route table 1001.
++You can do that e.g. in the file, describing your adapter serving local network (e.g. 10-br0.network), additionally to its native properties like:
++```
++[Match]
++Name = br0
++Type = bridge
++
++[Network]
++...skip...
++Address = 192.168.0.1/24
++...skip...
++
++[Route]
++Table = 1001
++Destination = 192.168.0.0/24
++PreferredSource = 192.168.0.1
++Scope = link
++```
++All in all systemd-networkd and its derivatives (like netplan or NetworkManager) provide all means to configure your networking, according to your wish, that will ensure network consistency of xray0 interface coming up and down, relative to other network configuration like internet interfaces, nat rules and so on.
++
++## WINDOWS SUPPORT
++
++Windows version of the same functionality is implemented through Wintun library. \
++To make it start, wintun.dll specific for your Windows/arch must be present next to Xray.exe binary.
++
++After the start network adapter with the name you chose in the config will be created in the system, and exist while Xray is running.
++
++You can give the adapter ip address manually, you can live Windows to give it autogenerated ip address (which take few seconds), it doesn't matter, the traffic going _through_ the interface will be forwarded into the app for proxying. \
++Minimal configuration that will work for local machine is routing passing the traffic on-link through the interface.
++You will need the interface id for that, unfortunately it is going to change with every Xray start due to implementation ambiguity between Xray and wintun driver.
++You can find the interface id with the command
++```
++route print
++```
++it will be in the list of interfaces on the top of the output
++```
++===========================================================================
++Interface List
++  8...cc cc cc cc cc cc ......Realtek PCIe GbE Family Controller
++ 47...........................Xray Tunnel
++  1...........................Software Loopback Interface 1
++===========================================================================
++```
++In this case the interface id is "47". \
++Then you can add on-link route through the adapter with (example) command
++```
++route add 1.1.1.1 mask 255.0.0.0 0.0.0.0 if 47
++```
++Note on ipv6 support. \
++Despite Windows also giving the adapter autoconfigured ipv6 address, the ipv6 is not possible until the interface has any _routable_ ipv6 address (given link-local address will not accept traffic from external addresses). \
++So everything applicable for ipv4 above also works for ipv6, you only need to give the interface some address manually, e.g. anything private like fc00::a:b:c:d/64 will do just fine
++
++## MAC OS X SUPPORT
++
++Darwin (Mac OS X) support of the same functionality is implemented through utun (userspace tunnel).
++
++Interface name in the configuration must comply to the scheme "utunN", where N is some number. \
++Most running OS'es create some amount of utun interfaces in advance for own needs. Please either check the interfaces you already have occupied by issuing following command:
++```
++ifconfig
++```
++Produced list will have all system interfaces listed, from which you will see how many "utun" ones already exists.
++It's not required to select next available number, e.g. if you have utun1-utun7 interfaces, it's not required to have "utun8" in the config. You can choose any available name, even utun20, to get surely available interface number.
++
++To attach routing to the interface, route command like following can be executed:
++```
++sudo route add -net 1.1.1.0/24 -iface utun10
++```
++```
++sudo route add -inet6 -host 2606:4700:4700::1111 -iface utun10
++sudo route add -inet6 -host 2606:4700:4700::1001 -iface utun10
++```
++Important to remember that everything written above about Linux routing concept, also apply to Mac OS X. If you simply route default route through utun interface, that will result network loop and immediate network failure.
++
++## ANDROID SUPPORT
++
++Android uses the VpnService API which provides a TUN file descriptor to the application.
++
++Obtain the fd from VpnService:
++```kotlin
++val tunFd = vpnInterface.fd
++```
++
++Set the environment variable `xray.tun.fd` (or `XRAY_TUN_FD`) to the fd number before starting Xray. This can be done from Kotlin/Java or by exposing a Go function via gomobile bindings.
++
++Build using gomobile for Android library integration:
++```
++gomobile bind -target=android
++```
++
++## iOS SUPPORT
++
++iOS uses the same utun packet format as macOS, but the file descriptor is provided by NetworkExtension.
++
++Obtain the fd from NetworkExtension:
++```swift
++var buf = [CChar](repeating: 0, count: Int(IFNAMSIZ))
++let utunPrefix = "utun".utf8CString.dropLast()
++let tunFd = ((0 ... 1024).first { (_ fd: Int32) -> Bool in var len = socklen_t(buf.count)
++    return getsockopt(fd, 2, 2, &buf, &len) == 0 && buf.starts(with: utunPrefix)
++}!
++```
++
++Set the environment variable `xray.tun.fd` (or `XRAY_TUN_FD`) to the fd number before starting Xray. This can be done from Swift/Objective-C or by exposing a Go function via gomobile bindings.
++
++Build using gomobile for iOS framework integration:
++```
++gomobile bind -target=ios
++```
+\ No newline at end of file
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/config.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/config.go
+--- v25.12.2-pristine/proxy/tun/config.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/config.go	2026-02-12 00:57:17
+@@ -0,0 +1 @@
++package tun
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/config.pb.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/config.pb.go
+--- v25.12.2-pristine/proxy/tun/config.pb.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/config.pb.go	2026-02-12 00:57:17
+@@ -0,0 +1,142 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.36.11
++// 	protoc        v6.33.5
++// source: proxy/tun/config.proto
++
++package tun
++
++import (
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	reflect "reflect"
++	sync "sync"
++	unsafe "unsafe"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++type Config struct {
++	state         protoimpl.MessageState `protogen:"open.v1"`
++	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
++	MTU           uint32                 `protobuf:"varint,2,opt,name=MTU,proto3" json:"MTU,omitempty"`
++	UserLevel     uint32                 `protobuf:"varint,3,opt,name=user_level,json=userLevel,proto3" json:"user_level,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache     protoimpl.SizeCache
++}
++
++func (x *Config) Reset() {
++	*x = Config{}
++	mi := &file_proxy_tun_config_proto_msgTypes[0]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *Config) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*Config) ProtoMessage() {}
++
++func (x *Config) ProtoReflect() protoreflect.Message {
++	mi := &file_proxy_tun_config_proto_msgTypes[0]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use Config.ProtoReflect.Descriptor instead.
++func (*Config) Descriptor() ([]byte, []int) {
++	return file_proxy_tun_config_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *Config) GetName() string {
++	if x != nil {
++		return x.Name
++	}
++	return ""
++}
++
++func (x *Config) GetMTU() uint32 {
++	if x != nil {
++		return x.MTU
++	}
++	return 0
++}
++
++func (x *Config) GetUserLevel() uint32 {
++	if x != nil {
++		return x.UserLevel
++	}
++	return 0
++}
++
++var File_proxy_tun_config_proto protoreflect.FileDescriptor
++
++const file_proxy_tun_config_proto_rawDesc = "" +
++	"\n" +
++	"\x16proxy/tun/config.proto\x12\x0exray.proxy.tun\"M\n" +
++	"\x06Config\x12\x12\n" +
++	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
++	"\x03MTU\x18\x02 \x01(\rR\x03MTU\x12\x1d\n" +
++	"\n" +
++	"user_level\x18\x03 \x01(\rR\tuserLevelBL\n" +
++	"\x12com.xray.proxy.tunP\x01Z#github.com/xtls/xray-core/proxy/tun\xaa\x02\x0eXray.Proxy.Tunb\x06proto3"
++
++var (
++	file_proxy_tun_config_proto_rawDescOnce sync.Once
++	file_proxy_tun_config_proto_rawDescData []byte
++)
++
++func file_proxy_tun_config_proto_rawDescGZIP() []byte {
++	file_proxy_tun_config_proto_rawDescOnce.Do(func() {
++		file_proxy_tun_config_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proxy_tun_config_proto_rawDesc), len(file_proxy_tun_config_proto_rawDesc)))
++	})
++	return file_proxy_tun_config_proto_rawDescData
++}
++
++var file_proxy_tun_config_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
++var file_proxy_tun_config_proto_goTypes = []any{
++	(*Config)(nil), // 0: xray.proxy.tun.Config
++}
++var file_proxy_tun_config_proto_depIdxs = []int32{
++	0, // [0:0] is the sub-list for method output_type
++	0, // [0:0] is the sub-list for method input_type
++	0, // [0:0] is the sub-list for extension type_name
++	0, // [0:0] is the sub-list for extension extendee
++	0, // [0:0] is the sub-list for field type_name
++}
++
++func init() { file_proxy_tun_config_proto_init() }
++func file_proxy_tun_config_proto_init() {
++	if File_proxy_tun_config_proto != nil {
++		return
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proxy_tun_config_proto_rawDesc), len(file_proxy_tun_config_proto_rawDesc)),
++			NumEnums:      0,
++			NumMessages:   1,
++			NumExtensions: 0,
++			NumServices:   0,
++		},
++		GoTypes:           file_proxy_tun_config_proto_goTypes,
++		DependencyIndexes: file_proxy_tun_config_proto_depIdxs,
++		MessageInfos:      file_proxy_tun_config_proto_msgTypes,
++	}.Build()
++	File_proxy_tun_config_proto = out.File
++	file_proxy_tun_config_proto_goTypes = nil
++	file_proxy_tun_config_proto_depIdxs = nil
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/config.proto /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/config.proto
+--- v25.12.2-pristine/proxy/tun/config.proto	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/config.proto	2026-02-12 00:57:17
+@@ -0,0 +1,13 @@
++syntax = "proto3";
++
++package xray.proxy.tun;
++option csharp_namespace = "Xray.Proxy.Tun";
++option go_package = "github.com/xtls/xray-core/proxy/tun";
++option java_package = "com.xray.proxy.tun";
++option java_multiple_files = true;
++
++message Config {
++  string name = 1;
++  uint32 MTU = 2;
++  uint32 user_level = 3;
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/handler.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/handler.go
+--- v25.12.2-pristine/proxy/tun/handler.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/handler.go	2026-02-12 00:57:17
+@@ -0,0 +1,168 @@
++package tun
++
++import (
++	"context"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/buf"
++	c "github.com/xtls/xray-core/common/ctx"
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/log"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/features/policy"
++	"github.com/xtls/xray-core/features/routing"
++	"github.com/xtls/xray-core/transport"
++	"github.com/xtls/xray-core/transport/internet/stat"
++)
++
++// Handler is managing object that tie together tun interface, ip stack and dispatch connections to the routing
++type Handler struct {
++	ctx             context.Context
++	config          *Config
++	stack           Stack
++	policyManager   policy.Manager
++	dispatcher      routing.Dispatcher
++	tag             string
++	sniffingRequest session.SniffingRequest
++}
++
++// ConnectionHandler interface with the only method that stack is going to push new connections to
++type ConnectionHandler interface {
++	HandleConnection(conn net.Conn, destination net.Destination)
++}
++
++// Handler implements ConnectionHandler
++var _ ConnectionHandler = (*Handler)(nil)
++
++func (t *Handler) policy() policy.Session {
++	p := t.policyManager.ForLevel(t.config.UserLevel)
++	return p
++}
++
++// Init the Handler instance with necessary parameters
++func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routing.Dispatcher) error {
++	var err error
++
++	// Retrieve tag and sniffing config from context (set by AlwaysOnInboundHandler)
++	if inbound := session.InboundFromContext(ctx); inbound != nil {
++		t.tag = inbound.Tag
++	}
++	if content := session.ContentFromContext(ctx); content != nil {
++		t.sniffingRequest = content.SniffingRequest
++	}
++
++	t.ctx = core.ToBackgroundDetachedContext(ctx)
++	t.policyManager = pm
++	t.dispatcher = dispatcher
++
++	tunName := t.config.Name
++	tunOptions := TunOptions{
++		Name: tunName,
++		MTU:  t.config.MTU,
++	}
++	tunInterface, err := NewTun(tunOptions)
++	if err != nil {
++		return err
++	}
++
++	errors.LogInfo(t.ctx, tunName, " created")
++
++	tunStackOptions := StackOptions{
++		Tun:         tunInterface,
++		IdleTimeout: pm.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
++	}
++	tunStack, err := NewStack(t.ctx, tunStackOptions, t)
++	if err != nil {
++		_ = tunInterface.Close()
++		return err
++	}
++
++	err = tunStack.Start()
++	if err != nil {
++		_ = tunStack.Close()
++		_ = tunInterface.Close()
++		return err
++	}
++
++	err = tunInterface.Start()
++	if err != nil {
++		_ = tunStack.Close()
++		_ = tunInterface.Close()
++		return err
++	}
++
++	t.stack = tunStack
++
++	errors.LogInfo(t.ctx, tunName, " up")
++	return nil
++}
++
++// HandleConnection pass the connection coming from the ip stack to the routing dispatcher
++func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
++	// when handling is done with any outcome, always signal back to the incoming connection
++	// to close, send completion packets back to the network, and cleanup
++	defer conn.Close()
++
++	ctx, cancel := context.WithCancel(t.ctx)
++	defer cancel()
++	ctx = c.ContextWithID(ctx, session.NewID())
++
++	source := net.DestinationFromAddr(conn.RemoteAddr())
++	inbound := session.Inbound{
++		Name:          "tun",
++		Tag:           t.tag,
++		CanSpliceCopy: 3,
++		Source:        source,
++		User: &protocol.MemoryUser{
++			Level: t.config.UserLevel,
++		},
++	}
++
++	ctx = session.ContextWithInbound(ctx, &inbound)
++	ctx = session.ContextWithContent(ctx, &session.Content{
++		SniffingRequest: t.sniffingRequest,
++	})
++	ctx = session.SubContextFromMuxInbound(ctx)
++
++	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
++		From:   inbound.Source,
++		To:     destination,
++		Status: log.AccessAccepted,
++		Reason: "",
++	})
++	errors.LogInfo(ctx, "processing from ", source, " to ", destination)
++
++	link := &transport.Link{
++		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)},
++		Writer: buf.NewWriter(conn),
++	}
++	if err := t.dispatcher.DispatchLink(ctx, destination, link); err != nil {
++		errors.LogError(ctx, errors.New("connection closed").Base(err))
++	}
++}
++
++// Network implements proxy.Inbound
++// and exists only to comply to proxy interface, declaring it doesn't listen on any network,
++// making the process not open any port for this inbound (input will be network interface)
++func (t *Handler) Network() []net.Network {
++	return []net.Network{}
++}
++
++// Process implements proxy.Inbound
++// and exists only to comply to proxy interface, which should never get any inputs due to no listening ports
++func (t *Handler) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
++	return nil
++}
++
++func init() {
++	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
++		t := &Handler{config: config.(*Config)}
++		err := core.RequireFeatures(ctx, func(pm policy.Manager, dispatcher routing.Dispatcher) error {
++			return t.Init(ctx, pm, dispatcher)
++		})
++		return t, err
++	}))
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/stack.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/stack.go
+--- v25.12.2-pristine/proxy/tun/stack.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/stack.go	2026-02-12 00:57:17
+@@ -0,0 +1,17 @@
++package tun
++
++import (
++	"time"
++)
++
++// Stack interface implement ip protocol stack, bridging raw network packets and data streams
++type Stack interface {
++	Start() error
++	Close() error
++}
++
++// StackOptions for the stack implementation
++type StackOptions struct {
++	Tun         Tun
++	IdleTimeout time.Duration
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/stack_gvisor.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/stack_gvisor.go
+--- v25.12.2-pristine/proxy/tun/stack_gvisor.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/stack_gvisor.go	2026-02-12 00:57:17
+@@ -0,0 +1,264 @@
++package tun
++
++import (
++	"context"
++	"time"
++
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/net"
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
++	"gvisor.dev/gvisor/pkg/tcpip/checksum"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
++	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
++	"gvisor.dev/gvisor/pkg/waiter"
++)
++
++const (
++	defaultNIC tcpip.NICID = 1
++
++	tcpRXBufMinSize = tcp.MinBufferSize
++	tcpRXBufDefSize = tcp.DefaultSendBufferSize
++	tcpRXBufMaxSize = 8 << 20 // 8MiB
++
++	tcpTXBufMinSize = tcp.MinBufferSize
++	tcpTXBufDefSize = tcp.DefaultReceiveBufferSize
++	tcpTXBufMaxSize = 6 << 20 // 6MiB
++)
++
++// stackGVisor is ip stack implemented by gVisor package
++type stackGVisor struct {
++	ctx         context.Context
++	tun         GVisorTun
++	idleTimeout time.Duration
++	handler     *Handler
++	stack       *stack.Stack
++	endpoint    stack.LinkEndpoint
++}
++
++// GVisorTun implements a bridge to connect gVisor ip stack to tun interface
++type GVisorTun interface {
++	newEndpoint() (stack.LinkEndpoint, error)
++}
++
++// NewStack builds new ip stack (using gVisor)
++func NewStack(ctx context.Context, options StackOptions, handler *Handler) (Stack, error) {
++	gStack := &stackGVisor{
++		ctx:         ctx,
++		tun:         options.Tun.(GVisorTun),
++		idleTimeout: options.IdleTimeout,
++		handler:     handler,
++	}
++
++	return gStack, nil
++}
++
++// Start is called by Handler to bring stack to life
++func (t *stackGVisor) Start() error {
++	linkEndpoint, err := t.tun.newEndpoint()
++	if err != nil {
++		return err
++	}
++
++	ipStack, err := createStack(linkEndpoint)
++	if err != nil {
++		return err
++	}
++
++	tcpForwarder := tcp.NewForwarder(ipStack, 0, 65535, func(r *tcp.ForwarderRequest) {
++		go func(r *tcp.ForwarderRequest) {
++			var wq waiter.Queue
++			var id = r.ID()
++
++			// Perform a TCP three-way handshake.
++			ep, err := r.CreateEndpoint(&wq)
++			if err != nil {
++				errors.LogError(t.ctx, err.String())
++				r.Complete(true)
++				return
++			}
++
++			options := ep.SocketOptions()
++			options.SetKeepAlive(false)
++			options.SetReuseAddress(true)
++			options.SetReusePort(true)
++
++			t.handler.HandleConnection(
++				gonet.NewTCPConn(&wq, ep),
++				// local address on the gVisor side is connection destination
++				net.TCPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort)),
++			)
++
++			// close the socket
++			ep.Close()
++			// send connection complete upstream
++			r.Complete(false)
++		}(r)
++	})
++	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
++
++	// Use custom UDP packet handler, instead of strict gVisor forwarder, for FullCone NAT support
++	udpForwarder := newUdpConnectionHandler(t.handler.HandleConnection, t.writeRawUDPPacket)
++	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
++		data := pkt.Data().AsRange().ToSlice()
++		if len(data) == 0 {
++			return false
++		}
++		// source/destination of the packet we process as incoming, on gVisor side are Remote/Local
++		// in other terms, src is the side behind tun, dst is the side behind gVisor
++		// this function handle packets passing from the tun to the gVisor, therefore the src/dst assignement
++		src := net.UDPDestination(net.IPAddress(id.RemoteAddress.AsSlice()), net.Port(id.RemotePort))
++		dst := net.UDPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort))
++
++		return udpForwarder.HandlePacket(src, dst, data)
++	})
++
++	t.stack = ipStack
++	t.endpoint = linkEndpoint
++
++	return nil
++}
++
++func (t *stackGVisor) writeRawUDPPacket(payload []byte, src net.Destination, dst net.Destination) error {
++	udpLen := header.UDPMinimumSize + len(payload)
++	srcIP := tcpip.AddrFromSlice(src.Address.IP())
++	dstIP := tcpip.AddrFromSlice(dst.Address.IP())
++
++	// build packet with appropriate IP header size
++	isIPv4 := dst.Address.Family().IsIPv4()
++	ipHdrSize := header.IPv6MinimumSize
++	ipProtocol := header.IPv6ProtocolNumber
++	if isIPv4 {
++		ipHdrSize = header.IPv4MinimumSize
++		ipProtocol = header.IPv4ProtocolNumber
++	}
++
++	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
++		ReserveHeaderBytes: ipHdrSize + header.UDPMinimumSize,
++		Payload:            buffer.MakeWithData(payload),
++	})
++	defer pkt.DecRef()
++
++	// Build UDP header
++	udpHdr := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))
++	udpHdr.Encode(&header.UDPFields{
++		SrcPort: uint16(src.Port),
++		DstPort: uint16(dst.Port),
++		Length:  uint16(udpLen),
++	})
++
++	// Calculate and set UDP checksum
++	xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, srcIP, dstIP, uint16(udpLen))
++	udpHdr.SetChecksum(^udpHdr.CalculateChecksum(checksum.Checksum(payload, xsum)))
++
++	// Build IP header
++	if isIPv4 {
++		ipHdr := header.IPv4(pkt.NetworkHeader().Push(header.IPv4MinimumSize))
++		ipHdr.Encode(&header.IPv4Fields{
++			TotalLength: uint16(header.IPv4MinimumSize + udpLen),
++			TTL:         64,
++			Protocol:    uint8(header.UDPProtocolNumber),
++			SrcAddr:     srcIP,
++			DstAddr:     dstIP,
++		})
++		ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
++	} else {
++		ipHdr := header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize))
++		ipHdr.Encode(&header.IPv6Fields{
++			PayloadLength:     uint16(udpLen),
++			TransportProtocol: header.UDPProtocolNumber,
++			HopLimit:          64,
++			SrcAddr:           srcIP,
++			DstAddr:           dstIP,
++		})
++	}
++
++	// dispatch the packet
++	err := t.stack.WriteRawPacket(defaultNIC, ipProtocol, buffer.MakeWithView(pkt.ToView()))
++	if err != nil {
++		return errors.New("failed to write raw udp packet back to stack", err)
++	}
++
++	return nil
++}
++
++// Close is called by Handler to shut down the stack
++func (t *stackGVisor) Close() error {
++	if t.stack == nil {
++		return nil
++	}
++	t.endpoint.Attach(nil)
++	t.stack.Close()
++	for _, endpoint := range t.stack.CleanupEndpoints() {
++		endpoint.Abort()
++	}
++
++	return nil
++}
++
++// createStack configure gVisor ip stack
++func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
++	opts := stack.Options{
++		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
++		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
++		HandleLocal:        false,
++	}
++	gStack := stack.New(opts)
++
++	err := gStack.CreateNIC(defaultNIC, ep)
++	if err != nil {
++		return nil, errors.New(err.String())
++	}
++
++	gStack.SetRouteTable([]tcpip.Route{
++		{Destination: header.IPv4EmptySubnet, NIC: defaultNIC},
++		{Destination: header.IPv6EmptySubnet, NIC: defaultNIC},
++	})
++
++	err = gStack.SetSpoofing(defaultNIC, true)
++	if err != nil {
++		return nil, errors.New(err.String())
++	}
++	err = gStack.SetPromiscuousMode(defaultNIC, true)
++	if err != nil {
++		return nil, errors.New(err.String())
++	}
++
++	cOpt := tcpip.CongestionControlOption("cubic")
++	gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &cOpt)
++	sOpt := tcpip.TCPSACKEnabled(true)
++	gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &sOpt)
++	mOpt := tcpip.TCPModerateReceiveBufferOption(true)
++	gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &mOpt)
++
++	// Disable RACK/TLP loss recovery to fix connection stalls under high load
++	rOpt := tcpip.TCPRecovery(0)
++	gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &rOpt)
++
++	tcpRXBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{
++		Min:     tcpRXBufMinSize,
++		Default: tcpRXBufDefSize,
++		Max:     tcpRXBufMaxSize,
++	}
++	err = gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRXBufOpt)
++	if err != nil {
++		return nil, errors.New(err.String())
++	}
++
++	tcpTXBufOpt := tcpip.TCPSendBufferSizeRangeOption{
++		Min:     tcpTXBufMinSize,
++		Default: tcpTXBufDefSize,
++		Max:     tcpTXBufMaxSize,
++	}
++	err = gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpTXBufOpt)
++	if err != nil {
++		return nil, errors.New(err.String())
++	}
++
++	return gStack, nil
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/stack_gvisor_endpoint.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/stack_gvisor_endpoint.go
+--- v25.12.2-pristine/proxy/tun/stack_gvisor_endpoint.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/stack_gvisor_endpoint.go	2026-02-12 00:57:17
+@@ -0,0 +1,155 @@
++package tun
++
++import (
++	"context"
++	"errors"
++
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++var ErrQueueEmpty = errors.New("queue is empty")
++
++type GVisorDevice interface {
++	WritePacket(packet *stack.PacketBuffer) tcpip.Error
++	ReadPacket() (byte, *stack.PacketBuffer, error)
++	Wait()
++}
++
++// LinkEndpoint implements GVisor stack.LinkEndpoint
++var _ stack.LinkEndpoint = (*LinkEndpoint)(nil)
++
++type LinkEndpoint struct {
++	deviceMTU        uint32
++	device           GVisorDevice
++	dispatcherCancel context.CancelFunc
++}
++
++func (e *LinkEndpoint) MTU() uint32 {
++	return e.deviceMTU
++}
++
++func (e *LinkEndpoint) SetMTU(_ uint32) {
++	// not Implemented, as it is not expected GVisor will be asking tun device to be modified
++}
++
++func (e *LinkEndpoint) MaxHeaderLength() uint16 {
++	return 0
++}
++
++func (e *LinkEndpoint) LinkAddress() tcpip.LinkAddress {
++	return ""
++}
++
++func (e *LinkEndpoint) SetLinkAddress(_ tcpip.LinkAddress) {
++	// not Implemented, as it is not expected GVisor will be asking tun device to be modified
++}
++
++func (e *LinkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
++	return stack.CapabilityRXChecksumOffload
++}
++
++func (e *LinkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
++	if e.dispatcherCancel != nil {
++		e.dispatcherCancel()
++		e.dispatcherCancel = nil
++	}
++
++	if dispatcher != nil {
++		ctx, cancel := context.WithCancel(context.Background())
++		go e.dispatchLoop(ctx, dispatcher)
++		e.dispatcherCancel = cancel
++	}
++}
++
++func (e *LinkEndpoint) IsAttached() bool {
++	return e.dispatcherCancel != nil
++}
++
++func (e *LinkEndpoint) Wait() {
++
++}
++
++func (e *LinkEndpoint) ARPHardwareType() header.ARPHardwareType {
++	return header.ARPHardwareNone
++}
++
++func (e *LinkEndpoint) AddHeader(buffer *stack.PacketBuffer) {
++	// tun interface doesn't have link layer header, it will be added by the OS
++}
++
++func (e *LinkEndpoint) ParseHeader(ptr *stack.PacketBuffer) bool {
++	return true
++}
++
++func (e *LinkEndpoint) Close() {
++	if e.dispatcherCancel != nil {
++		e.dispatcherCancel()
++		e.dispatcherCancel = nil
++	}
++}
++
++func (e *LinkEndpoint) SetOnCloseAction(_ func()) {
++
++}
++
++func (e *LinkEndpoint) WritePackets(packetBufferList stack.PacketBufferList) (int, tcpip.Error) {
++	var n int
++	var err tcpip.Error
++
++	for _, packetBuffer := range packetBufferList.AsSlice() {
++		err = e.device.WritePacket(packetBuffer)
++		if err != nil {
++			return n, &tcpip.ErrAborted{}
++		}
++		n++
++	}
++
++	return n, nil
++}
++
++func (e *LinkEndpoint) dispatchLoop(ctx context.Context, dispatcher stack.NetworkDispatcher) {
++	var networkProtocolNumber tcpip.NetworkProtocolNumber
++	var version byte
++	var packet *stack.PacketBuffer
++	var err error
++
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		default:
++			version, packet, err = e.device.ReadPacket()
++			// on "queue empty", ask device to yield slightly and continue
++			if errors.Is(err, ErrQueueEmpty) {
++				e.device.Wait()
++				continue
++			}
++			// stop dispatcher loop on any other interface failure
++			if err != nil {
++				e.Attach(nil)
++				return
++			}
++
++			// extract network protocol number from the packet first byte
++			// (which is returned separately, since it is so incredibly hard to extract one byte from
++			// stack.PacketBuffer without additional memory allocation and full copying it back and forth)
++			switch version {
++			case 4:
++				networkProtocolNumber = header.IPv4ProtocolNumber
++			case 6:
++				networkProtocolNumber = header.IPv6ProtocolNumber
++			default:
++				// discard unknown network protocol packet
++				packet.DecRef()
++				continue
++			}
++
++			// dispatch the buffer to the stack
++			dispatcher.DeliverNetworkPacket(networkProtocolNumber, packet)
++			// signal the buffer that it can be released
++			packet.DecRef()
++		}
++	}
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/tun.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun.go
+--- v25.12.2-pristine/proxy/tun/tun.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun.go	2026-02-12 00:57:17
+@@ -0,0 +1,13 @@
++package tun
++
++// Tun interface implements tun interface interaction
++type Tun interface {
++	Start() error
++	Close() error
++}
++
++// TunOptions for tun interface implementation
++type TunOptions struct {
++	Name string
++	MTU  uint32
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/tun_android.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun_android.go
+--- v25.12.2-pristine/proxy/tun/tun_android.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun_android.go	2026-02-12 00:57:17
+@@ -0,0 +1,58 @@
++//go:build android
++
++package tun
++
++import (
++	"context"
++	"strconv"
++
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/platform"
++	"golang.org/x/sys/unix"
++	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++type AndroidTun struct {
++	tunFd   int
++	options TunOptions
++}
++
++// DefaultTun implements Tun
++var _ Tun = (*AndroidTun)(nil)
++
++// DefaultTun implements GVisorTun
++var _ GVisorTun = (*AndroidTun)(nil)
++
++// NewTun builds new tun interface handler
++func NewTun(options TunOptions) (Tun, error) {
++	fd, err := strconv.Atoi(platform.NewEnvFlag(platform.TunFdKey).GetValue(func() string { return "0" }))
++	errors.LogInfo(context.Background(), "read Android Tun Fd ", fd, err)
++
++	err = unix.SetNonblock(fd, true)
++	if err != nil {
++		_ = unix.Close(fd)
++		return nil, err
++	}
++
++	return &AndroidTun{
++		tunFd:   fd,
++		options: options,
++	}, nil
++}
++
++func (t *AndroidTun) Start() error {
++	return nil
++}
++
++func (t *AndroidTun) Close() error {
++	return nil
++}
++
++func (t *AndroidTun) newEndpoint() (stack.LinkEndpoint, error) {
++	return fdbased.New(&fdbased.Options{
++		FDs:               []int{t.tunFd},
++		MTU:               t.options.MTU,
++		RXChecksumOffload: true,
++	})
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/tun_darwin.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun_darwin.go
+--- v25.12.2-pristine/proxy/tun/tun_darwin.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun_darwin.go	2026-02-12 00:57:17
+@@ -0,0 +1,354 @@
++//go:build darwin
++
++package tun
++
++import (
++	"errors"
++	"fmt"
++	"net"
++	"net/netip"
++	"os"
++	"strconv"
++	"syscall"
++	"unsafe"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/platform"
++	"golang.org/x/sys/unix"
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++const (
++	utunControlName = "com.apple.net.utun_control"
++	sysprotoControl = 2
++	gateway         = "169.254.10.1/30"
++	utunHeaderSize  = 4
++)
++
++const (
++	SIOCAIFADDR6          = 2155899162 // netinet6/in6_var.h
++	IN6_IFF_NODAD         = 0x0020     // netinet6/in6_var.h
++	IN6_IFF_SECURED       = 0x0400     // netinet6/in6_var.h
++	ND6_INFINITE_LIFETIME = 0xFFFFFFFF // netinet6/nd6.h
++)
++
++//go:linkname procyield runtime.procyield
++func procyield(cycles uint32)
++
++type DarwinTun struct {
++	tunFile *os.File
++	options TunOptions
++	ownsFd  bool // true for macOS (we created the fd), false for iOS (fd from system)
++}
++
++var _ Tun = (*DarwinTun)(nil)
++var _ GVisorTun = (*DarwinTun)(nil)
++var _ GVisorDevice = (*DarwinTun)(nil)
++
++func NewTun(options TunOptions) (Tun, error) {
++	// Check if fd is provided via environment (iOS mode)
++	fdStr := platform.NewEnvFlag(platform.TunFdKey).GetValue(func() string { return "" })
++	if fdStr != "" {
++		// iOS: use provided fd from NetworkExtension
++		fd, err := strconv.Atoi(fdStr)
++		if err != nil {
++			return nil, err
++		}
++
++		if err = unix.SetNonblock(fd, true); err != nil {
++			return nil, err
++		}
++
++		return &DarwinTun{
++			tunFile: os.NewFile(uintptr(fd), "utun"),
++			options: options,
++			ownsFd:  false,
++		}, nil
++	}
++
++	// macOS: create our own utun interface
++	tunFile, err := open(options.Name)
++	if err != nil {
++		return nil, err
++	}
++
++	err = setup(options.Name, options.MTU)
++	if err != nil {
++		_ = tunFile.Close()
++		return nil, err
++	}
++
++	return &DarwinTun{
++		tunFile: tunFile,
++		options: options,
++		ownsFd:  true,
++	}, nil
++}
++
++func (t *DarwinTun) Start() error {
++	return nil
++}
++
++func (t *DarwinTun) Close() error {
++	if t.ownsFd {
++		return t.tunFile.Close()
++	}
++	// iOS: don't close the fd, it's owned by NetworkExtension
++	return nil
++}
++
++// WritePacket implements GVisorDevice method to write one packet to the tun device
++func (t *DarwinTun) WritePacket(packet *stack.PacketBuffer) tcpip.Error {
++	// request memory to write from reusable buffer pool
++	b := buf.NewWithSize(int32(t.options.MTU) + utunHeaderSize)
++	defer b.Release()
++
++	// prepare Darwin specific packet header
++	_, _ = b.Write([]byte{0x0, 0x0, 0x0, 0x0})
++	// copy the bytes of slices that compose the packet into the allocated buffer
++	for _, packetElement := range packet.AsSlices() {
++		_, _ = b.Write(packetElement)
++	}
++	// fill Darwin specific header from the first raw packet byte, that we can access now
++	var family byte
++	switch b.Byte(4) >> 4 {
++	case 4:
++		family = unix.AF_INET
++	case 6:
++		family = unix.AF_INET6
++	default:
++		return &tcpip.ErrAborted{}
++	}
++	b.SetByte(3, family)
++
++	if _, err := t.tunFile.Write(b.Bytes()); err != nil {
++		if errors.Is(err, unix.EAGAIN) {
++			return &tcpip.ErrWouldBlock{}
++		}
++		return &tcpip.ErrAborted{}
++	}
++	return nil
++}
++
++// ReadPacket implements GVisorDevice method to read one packet from the tun device
++// It is expected that the method will not block, rather return ErrQueueEmpty when there is nothing on the line,
++// which will make the stack call Wait which should implement desired push-back
++func (t *DarwinTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
++	// request memory to write from reusable buffer pool
++	b := buf.NewWithSize(int32(t.options.MTU) + utunHeaderSize)
++
++	// read the bytes to the interface file
++	n, err := b.ReadFrom(t.tunFile)
++	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
++		b.Release()
++		return 0, nil, ErrQueueEmpty
++	}
++	if err != nil {
++		b.Release()
++		return 0, nil, err
++	}
++
++	// discard empty or sub-empty packets
++	if n <= utunHeaderSize {
++		b.Release()
++		return 0, nil, ErrQueueEmpty
++	}
++
++	// network protocol version from first byte of the raw packet, the one that follows Darwin specific header
++	version := b.Byte(utunHeaderSize) >> 4
++	packetBuffer := buffer.MakeWithData(b.BytesFrom(utunHeaderSize))
++	return version, stack.NewPacketBuffer(stack.PacketBufferOptions{
++		Payload:           packetBuffer,
++		IsForwardedPacket: true,
++		OnRelease: func() {
++			b.Release()
++		},
++	}), nil
++}
++
++// Wait some cpu cycles
++func (t *DarwinTun) Wait() {
++	procyield(1)
++}
++
++func (t *DarwinTun) newEndpoint() (stack.LinkEndpoint, error) {
++	return &LinkEndpoint{deviceMTU: t.options.MTU, device: t}, nil
++}
++
++// open the interface, by creating new utunN if in the system and returning its file descriptor
++func open(name string) (*os.File, error) {
++	ifIndex := -1
++	_, err := fmt.Sscanf(name, "utun%d", &ifIndex)
++	if err != nil || ifIndex < 0 {
++		return nil, errors.New("interface name must be utunN, where N is a number, e.g. utun9, utun11 and so on")
++	}
++
++	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, sysprotoControl)
++	if err != nil {
++		return nil, err
++	}
++
++	ctlInfo := &unix.CtlInfo{}
++	copy(ctlInfo.Name[:], utunControlName)
++	if err := unix.IoctlCtlInfo(fd, ctlInfo); err != nil {
++		_ = unix.Close(fd)
++		return nil, err
++	}
++
++	sockaddr := &unix.SockaddrCtl{
++		ID:   ctlInfo.Id,
++		Unit: uint32(ifIndex) + 1,
++	}
++	if err := unix.Connect(fd, sockaddr); err != nil {
++		_ = unix.Close(fd)
++		return nil, err
++	}
++
++	if err := unix.SetNonblock(fd, true); err != nil {
++		_ = unix.Close(fd)
++		return nil, err
++	}
++
++	return os.NewFile(uintptr(fd), name), nil
++}
++
++// setup the interface by name
++func setup(name string, MTU uint32) error {
++	if err := setMTU(name, MTU); err != nil {
++		return err
++	}
++
++	/*
++	 * Darwin routing require tunnel type interface to have local and remote address, to be routable.
++	 * To simplify inevitable task, assign the interface static ip address, which in current implementation
++	 * is just some random ip from link-local pool, allowing to not bother about existing routing intersection.
++	 */
++	syntheticIP, _ := netip.ParsePrefix(gateway)
++	if err := setIPAddress(name, syntheticIP); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++// setMTU sets MTU on the interface by given name
++func setMTU(name string, mtu uint32) error {
++	socket, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
++	if err != nil {
++		return err
++	}
++	defer unix.Close(socket)
++
++	ifr := unix.IfreqMTU{MTU: int32(mtu)}
++	copy(ifr.Name[:], name)
++	return unix.IoctlSetIfreqMTU(socket, &ifr)
++}
++
++type ifAliasReq4 struct {
++	Name    [unix.IFNAMSIZ]byte
++	Addr    unix.RawSockaddrInet4
++	Dstaddr unix.RawSockaddrInet4
++	Mask    unix.RawSockaddrInet4
++}
++
++type ifAliasReq6 struct {
++	Name     [unix.IFNAMSIZ]byte
++	Addr     unix.RawSockaddrInet6
++	Dstaddr  unix.RawSockaddrInet6
++	Mask     unix.RawSockaddrInet6
++	Flags    uint32
++	Lifetime addrLifetime6
++}
++
++type addrLifetime6 struct {
++	Expire    float64
++	Preferred float64
++	Vltime    uint32
++	Pltime    uint32
++}
++
++// setIPAddress sets ipv4 and ipv6 addresses to the interface, required for the routing to work
++func setIPAddress(name string, gateway netip.Prefix) error {
++	socket4, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
++	if err != nil {
++		return err
++	}
++	defer unix.Close(socket4)
++
++	// assume local ip address is next one from the remote address
++	local4 := gateway.Addr().As4()
++	local4[3]++
++
++	// fill the configuration for ipv4
++	ifReq4 := ifAliasReq4{
++		Addr: unix.RawSockaddrInet4{
++			Len:    unix.SizeofSockaddrInet4,
++			Family: unix.AF_INET,
++			Addr:   local4,
++		},
++		Dstaddr: unix.RawSockaddrInet4{
++			Len:    unix.SizeofSockaddrInet4,
++			Family: unix.AF_INET,
++			Addr:   gateway.Addr().As4(),
++		},
++		Mask: unix.RawSockaddrInet4{
++			Len:    unix.SizeofSockaddrInet4,
++			Family: unix.AF_INET,
++			Addr:   netip.MustParseAddr(net.IP(net.CIDRMask(gateway.Bits(), 32)).String()).As4(),
++		},
++	}
++	copy(ifReq4.Name[:], name)
++	if err = ioctlPtr(socket4, unix.SIOCAIFADDR, unsafe.Pointer(&ifReq4)); err != nil {
++		return os.NewSyscallError("SIOCAIFADDR", err)
++	}
++
++	socket6, err := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM, 0)
++	if err != nil {
++		return err
++	}
++	defer unix.Close(socket6)
++
++	// link-local ipv6 address with suffix from ipv6
++	local6 := netip.AddrFrom16([16]byte{0: 0xfe, 1: 0x80, 12: local4[0], 13: local4[1], 14: local4[2], 15: local4[3]})
++
++	// fill the configuration for ipv6
++	// only link-local address without the destination is enough for it
++	ifReq6 := ifAliasReq6{
++		Addr: unix.RawSockaddrInet6{
++			Len:    unix.SizeofSockaddrInet6,
++			Family: unix.AF_INET6,
++			Addr:   local6.As16(),
++		},
++		Mask: unix.RawSockaddrInet6{
++			Len:    unix.SizeofSockaddrInet6,
++			Family: unix.AF_INET6,
++			Addr:   netip.MustParseAddr(net.IP(net.CIDRMask(64, 128)).String()).As16(),
++		},
++		Flags: IN6_IFF_NODAD,
++		Lifetime: addrLifetime6{
++			Vltime: ND6_INFINITE_LIFETIME,
++			Pltime: ND6_INFINITE_LIFETIME,
++		},
++	}
++	// assign link-local ipv6 address to the interface.
++	// this will additionally trigger OS level autoconfiguration, which will result two different link-local
++	// addresses - the requested one, and autoconfigured one.
++	// this really has no known side effects, just look excessive. and actually considered pretty normal way to
++	// enable the ipv6 on the interface by macOS concepts.
++	copy(ifReq6.Name[:], name)
++	if err = ioctlPtr(socket6, SIOCAIFADDR6, unsafe.Pointer(&ifReq6)); err != nil {
++		return os.NewSyscallError("SIOCAIFADDR6", err)
++	}
++
++	return nil
++}
++
++func ioctlPtr(fd int, req uint, arg unsafe.Pointer) error {
++	_, _, errno := unix.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(req), uintptr(arg))
++	if errno != 0 {
++		return errno
++	}
++	return nil
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/tun_default.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun_default.go
+--- v25.12.2-pristine/proxy/tun/tun_default.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun_default.go	2026-02-12 00:57:17
+@@ -0,0 +1,34 @@
++//go:build !linux && !windows && !android && !darwin
++
++package tun
++
++import (
++	"github.com/xtls/xray-core/common/errors"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++type DefaultTun struct {
++}
++
++// DefaultTun implements Tun
++var _ Tun = (*DefaultTun)(nil)
++
++// DefaultTun implements GVisorTun
++var _ GVisorTun = (*DefaultTun)(nil)
++
++// NewTun builds new tun interface handler
++func NewTun(options TunOptions) (Tun, error) {
++	return nil, errors.New("Tun is not supported on your platform")
++}
++
++func (t *DefaultTun) Start() error {
++	return errors.New("Tun is not supported on your platform")
++}
++
++func (t *DefaultTun) Close() error {
++	return errors.New("Tun is not supported on your platform")
++}
++
++func (t *DefaultTun) newEndpoint() (stack.LinkEndpoint, error) {
++	return nil, errors.New("Tun is not supported on your platform")
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/tun_linux.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun_linux.go
+--- v25.12.2-pristine/proxy/tun/tun_linux.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun_linux.go	2026-02-12 00:57:17
+@@ -0,0 +1,120 @@
++//go:build linux && !android
++
++package tun
++
++import (
++	"github.com/vishvananda/netlink"
++	"golang.org/x/sys/unix"
++	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++// LinuxTun is an object that handles tun network interface on linux
++// current version is heavily stripped to do nothing more,
++// then create a network interface, to be provided as file descriptor to gVisor ip stack
++type LinuxTun struct {
++	tunFd   int
++	tunLink netlink.Link
++	options TunOptions
++}
++
++// LinuxTun implements Tun
++var _ Tun = (*LinuxTun)(nil)
++
++// LinuxTun implements GVisorTun
++var _ GVisorTun = (*LinuxTun)(nil)
++
++// NewTun builds new tun interface handler (linux specific)
++func NewTun(options TunOptions) (Tun, error) {
++	tunFd, err := open(options.Name)
++	if err != nil {
++		return nil, err
++	}
++
++	tunLink, err := setup(options.Name, int(options.MTU))
++	if err != nil {
++		_ = unix.Close(tunFd)
++		return nil, err
++	}
++
++	linuxTun := &LinuxTun{
++		tunFd:   tunFd,
++		tunLink: tunLink,
++		options: options,
++	}
++
++	return linuxTun, nil
++}
++
++// open the file that implements tun interface in the OS
++func open(name string) (int, error) {
++	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR, 0)
++	if err != nil {
++		return -1, err
++	}
++
++	ifr, err := unix.NewIfreq(name)
++	if err != nil {
++		_ = unix.Close(fd)
++		return 0, err
++	}
++
++	flags := unix.IFF_TUN | unix.IFF_NO_PI
++	ifr.SetUint16(uint16(flags))
++	err = unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr)
++	if err != nil {
++		_ = unix.Close(fd)
++		return 0, err
++	}
++
++	err = unix.SetNonblock(fd, true)
++	if err != nil {
++		_ = unix.Close(fd)
++		return 0, err
++	}
++
++	return fd, nil
++}
++
++// setup the interface through netlink socket
++func setup(name string, MTU int) (netlink.Link, error) {
++	tunLink, err := netlink.LinkByName(name)
++	if err != nil {
++		return nil, err
++	}
++
++	err = netlink.LinkSetMTU(tunLink, MTU)
++	if err != nil {
++		_ = netlink.LinkSetDown(tunLink)
++		return nil, err
++	}
++
++	return tunLink, nil
++}
++
++// Start is called by handler to bring tun interface to life
++func (t *LinuxTun) Start() error {
++	err := netlink.LinkSetUp(t.tunLink)
++	if err != nil {
++		return err
++	}
++
++	return nil
++}
++
++// Close is called to shut down the tun interface
++func (t *LinuxTun) Close() error {
++	_ = netlink.LinkSetDown(t.tunLink)
++	_ = unix.Close(t.tunFd)
++
++	return nil
++}
++
++// newEndpoint builds new gVisor stack.LinkEndpoint from the tun interface file descriptor
++func (t *LinuxTun) newEndpoint() (stack.LinkEndpoint, error) {
++	return fdbased.New(&fdbased.Options{
++		FDs:               []int{t.tunFd},
++		MTU:               t.options.MTU,
++		RXChecksumOffload: true,
++	})
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/tun_windows.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun_windows.go
+--- v25.12.2-pristine/proxy/tun/tun_windows.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/tun_windows.go	2026-02-12 00:57:17
+@@ -0,0 +1,144 @@
++//go:build windows
++
++package tun
++
++import (
++	"errors"
++	_ "unsafe"
++
++	"golang.org/x/sys/windows"
++	"golang.zx2c4.com/wintun"
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++//go:linkname procyield runtime.procyield
++func procyield(cycles uint32)
++
++// WindowsTun is an object that handles tun network interface on Windows
++// current version is heavily stripped to do nothing more,
++// then create a network interface, to be provided as endpoint to gVisor ip stack
++type WindowsTun struct {
++	options  TunOptions
++	adapter  *wintun.Adapter
++	session  wintun.Session
++	readWait windows.Handle
++	MTU      uint32
++}
++
++// WindowsTun implements Tun
++var _ Tun = (*WindowsTun)(nil)
++
++// WindowsTun implements GVisorTun
++var _ GVisorTun = (*WindowsTun)(nil)
++
++// WindowsTun implements GVisorDevice
++var _ GVisorDevice = (*WindowsTun)(nil)
++
++// NewTun creates a Wintun interface with the given name. Should a Wintun
++// interface with the same name exist, it tried to be reused.
++func NewTun(options TunOptions) (Tun, error) {
++	// instantiate wintun adapter
++	adapter, err := open(options.Name)
++	if err != nil {
++		return nil, err
++	}
++
++	// start the interface with ring buffer capacity of 8 MiB
++	session, err := adapter.StartSession(0x800000)
++	if err != nil {
++		_ = adapter.Close()
++		return nil, err
++	}
++
++	tun := &WindowsTun{
++		options:  options,
++		adapter:  adapter,
++		session:  session,
++		readWait: session.ReadWaitEvent(),
++		// there is currently no iphndl.dll support, which is the netlink library for windows
++		// so there is nowhere to change MTU for the Wintun interface, and we take its default value
++		MTU: wintun.PacketSizeMax,
++	}
++
++	return tun, nil
++}
++
++func open(name string) (*wintun.Adapter, error) {
++	var guid *windows.GUID
++	// try to open existing adapter by name
++	adapter, err := wintun.OpenAdapter(name)
++	if err == nil {
++		return adapter, nil
++	}
++	// try to create adapter anew
++	adapter, err = wintun.CreateAdapter(name, "Xray", guid)
++	if err == nil {
++		return adapter, nil
++	}
++	return nil, err
++}
++
++func (t *WindowsTun) Start() error {
++	return nil
++}
++
++func (t *WindowsTun) Close() error {
++	t.session.End()
++	_ = t.adapter.Close()
++
++	return nil
++}
++
++// WritePacket implements GVisorDevice method to write one packet to the tun device
++func (t *WindowsTun) WritePacket(packetBuffer *stack.PacketBuffer) tcpip.Error {
++	// request buffer from Wintun
++	packet, err := t.session.AllocateSendPacket(packetBuffer.Size())
++	if err != nil {
++		return &tcpip.ErrAborted{}
++	}
++
++	// copy the bytes of slices that compose the packet into the allocated buffer
++	var index int
++	for _, packetElement := range packetBuffer.AsSlices() {
++		index += copy(packet[index:], packetElement)
++	}
++
++	// signal Wintun to send that buffer as the packet
++	t.session.SendPacket(packet)
++
++	return nil
++}
++
++// ReadPacket implements GVisorDevice method to read one packet from the tun device
++// It is expected that the method will not block, rather return ErrQueueEmpty when there is nothing on the line,
++// which will make the stack call Wait which should implement desired push-back
++func (t *WindowsTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
++	packet, err := t.session.ReceivePacket()
++	if errors.Is(err, windows.ERROR_NO_MORE_ITEMS) {
++		return 0, nil, ErrQueueEmpty
++	}
++	if err != nil {
++		return 0, nil, err
++	}
++
++	version := packet[0] >> 4
++	packetBuffer := buffer.MakeWithView(buffer.NewViewWithData(packet))
++	return version, stack.NewPacketBuffer(stack.PacketBufferOptions{
++		Payload:           packetBuffer,
++		IsForwardedPacket: true,
++		OnRelease: func() {
++			t.session.ReleaseReceivePacket(packet)
++		},
++	}), nil
++}
++
++func (t *WindowsTun) Wait() {
++	procyield(1)
++	_, _ = windows.WaitForSingleObject(t.readWait, windows.INFINITE)
++}
++
++func (t *WindowsTun) newEndpoint() (stack.LinkEndpoint, error) {
++	return &LinkEndpoint{deviceMTU: t.options.MTU, device: t}, nil
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/tun/udp_fullcone.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/udp_fullcone.go
+--- v25.12.2-pristine/proxy/tun/udp_fullcone.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/tun/udp_fullcone.go	2026-02-12 00:57:17
+@@ -0,0 +1,134 @@
++package tun
++
++import (
++	"io"
++	"sync"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++)
++
++// sub-handler specifically for udp connections under main handler
++type udpConnectionHandler struct {
++	sync.Mutex
++
++	udpConns map[net.Destination]*udpConn
++
++	handleConnection func(conn net.Conn, dest net.Destination)
++	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
++}
++
++func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Destination), writePacket func(data []byte, src net.Destination, dst net.Destination) error) *udpConnectionHandler {
++	handler := &udpConnectionHandler{
++		udpConns:         make(map[net.Destination]*udpConn),
++		handleConnection: handleConnection,
++		writePacket:      writePacket,
++	}
++
++	return handler
++}
++
++// HandlePacket handles UDP packets coming from tun, to forward to the dispatcher
++// this custom handler support FullCone NAT of returning packets, binding connection only by the source addr:port
++func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destination, data []byte) bool {
++	u.Lock()
++	conn, found := u.udpConns[src]
++	if !found {
++		egress := make(chan []byte, 16)
++		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
++		u.udpConns[src] = conn
++
++		go u.handleConnection(conn, dst)
++	}
++	u.Unlock()
++
++	// send packet data to the egress channel, if it has buffer, or discard
++	select {
++	case conn.egress <- data:
++	default:
++	}
++
++	return true
++}
++
++func (u *udpConnectionHandler) connectionFinished(src net.Destination) {
++	u.Lock()
++	conn, found := u.udpConns[src]
++	if found {
++		delete(u.udpConns, src)
++		close(conn.egress)
++	}
++	u.Unlock()
++}
++
++// udp connection abstraction
++type udpConn struct {
++	net.Conn
++	buf.Writer
++
++	handler *udpConnectionHandler
++
++	egress chan []byte
++	src    net.Destination
++	dst    net.Destination
++}
++
++// Read packets from the connection
++func (c *udpConn) Read(p []byte) (int, error) {
++	data, ok := <-c.egress
++	if !ok {
++		return 0, io.EOF
++	}
++
++	n := copy(p, data)
++	return n, nil
++}
++
++// Write returning packets back
++func (c *udpConn) Write(p []byte) (int, error) {
++	// sending packets back mean sending payload with source/destination reversed
++	err := c.handler.writePacket(p, c.dst, c.src)
++	if err != nil {
++		return 0, nil
++	}
++
++	return len(p), nil
++}
++
++func (c *udpConn) Close() error {
++	c.handler.connectionFinished(c.src)
++
++	return nil
++}
++
++func (c *udpConn) LocalAddr() net.Addr {
++	return &net.UDPAddr{IP: c.dst.Address.IP(), Port: int(c.dst.Port.Value())}
++}
++
++func (c *udpConn) RemoteAddr() net.Addr {
++	return &net.UDPAddr{IP: c.src.Address.IP(), Port: int(c.src.Port.Value())}
++}
++
++// Write returning packets back
++func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	for _, b := range mb {
++		dst := c.dst
++		if b.UDP != nil {
++			dst = *b.UDP
++		}
++
++		// validate address family matches between buffer packet and the connection
++		if dst.Address.Family() != c.dst.Address.Family() {
++			continue
++		}
++
++		// sending packets back mean sending payload with source/destination reversed
++		err := c.handler.writePacket(b.Bytes(), dst, c.src)
++		if err != nil {
++			// udp doesn't guarantee delivery, so in any failure we just continue to the next packet
++			continue
++		}
++	}
++
++	return nil
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/vless/encoding/addons.pb.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/vless/encoding/addons.pb.go
+--- v25.12.2-pristine/proxy/vless/encoding/addons.pb.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/vless/encoding/addons.pb.go	2026-03-22 17:11:44
+@@ -1,7 +1,7 @@
+ // Code generated by protoc-gen-go. DO NOT EDIT.
+ // versions:
+ // 	protoc-gen-go v1.35.1
+-// 	protoc        v5.28.2
++// 	protoc        v5.29.3
+ // source: proxy/vless/encoding/addons.proto
+ 
+ package encoding
+@@ -25,8 +25,10 @@
+ 	sizeCache     protoimpl.SizeCache
+ 	unknownFields protoimpl.UnknownFields
+ 
+-	Flow string `protobuf:"bytes,1,opt,name=Flow,proto3" json:"Flow,omitempty"`
+-	Seed []byte `protobuf:"bytes,2,opt,name=Seed,proto3" json:"Seed,omitempty"`
++	Flow          string `protobuf:"bytes,1,opt,name=Flow,proto3" json:"Flow,omitempty"`
++	Seed          []byte `protobuf:"bytes,2,opt,name=Seed,proto3" json:"Seed,omitempty"`
++	AuthVerified  bool   `protobuf:"varint,3,opt,name=AuthVerified,proto3" json:"AuthVerified,omitempty"`
++	ClientVersion string `protobuf:"bytes,4,opt,name=ClientVersion,proto3" json:"ClientVersion,omitempty"`
+ }
+ 
+ func (x *Addons) Reset() {
+@@ -73,24 +75,43 @@
+ 	return nil
+ }
+ 
++func (x *Addons) GetAuthVerified() bool {
++	if x != nil {
++		return x.AuthVerified
++	}
++	return false
++}
++
++func (x *Addons) GetClientVersion() string {
++	if x != nil {
++		return x.ClientVersion
++	}
++	return ""
++}
++
+ var File_proxy_vless_encoding_addons_proto protoreflect.FileDescriptor
+ 
+ var file_proxy_vless_encoding_addons_proto_rawDesc = []byte{
+ 	0x0a, 0x21, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2f, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2f, 0x65, 0x6e,
+ 	0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x2f, 0x61, 0x64, 0x64, 0x6f, 0x6e, 0x73, 0x2e, 0x70, 0x72,
+ 	0x6f, 0x74, 0x6f, 0x12, 0x19, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2e,
+-	0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x22, 0x30,
++	0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x22, 0x7a,
+ 	0x0a, 0x06, 0x41, 0x64, 0x64, 0x6f, 0x6e, 0x73, 0x12, 0x12, 0x0a, 0x04, 0x46, 0x6c, 0x6f, 0x77,
+ 	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x46, 0x6c, 0x6f, 0x77, 0x12, 0x12, 0x0a, 0x04,
+ 	0x53, 0x65, 0x65, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x04, 0x53, 0x65, 0x65, 0x64,
+-	0x42, 0x6d, 0x0a, 0x1d, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x70, 0x72, 0x6f,
+-	0x78, 0x79, 0x2e, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e,
+-	0x67, 0x50, 0x01, 0x5a, 0x2e, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f,
+-	0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78, 0x72, 0x61, 0x79, 0x2d, 0x63, 0x6f, 0x72, 0x65, 0x2f, 0x70,
+-	0x72, 0x6f, 0x78, 0x79, 0x2f, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2f, 0x65, 0x6e, 0x63, 0x6f, 0x64,
+-	0x69, 0x6e, 0x67, 0xaa, 0x02, 0x19, 0x58, 0x72, 0x61, 0x79, 0x2e, 0x50, 0x72, 0x6f, 0x78, 0x79,
+-	0x2e, 0x56, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x45, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x62,
+-	0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x12, 0x22, 0x0a, 0x0c, 0x41, 0x75, 0x74, 0x68, 0x56, 0x65, 0x72, 0x69, 0x66, 0x69, 0x65, 0x64,
++	0x18, 0x03, 0x20, 0x01, 0x28, 0x08, 0x52, 0x0c, 0x41, 0x75, 0x74, 0x68, 0x56, 0x65, 0x72, 0x69,
++	0x66, 0x69, 0x65, 0x64, 0x12, 0x24, 0x0a, 0x0d, 0x43, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x56, 0x65,
++	0x72, 0x73, 0x69, 0x6f, 0x6e, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0d, 0x43, 0x6c, 0x69,
++	0x65, 0x6e, 0x74, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x42, 0x6d, 0x0a, 0x1d, 0x63, 0x6f,
++	0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2e, 0x76, 0x6c, 0x65,
++	0x73, 0x73, 0x2e, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x50, 0x01, 0x5a, 0x2e, 0x67,
++	0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78,
++	0x72, 0x61, 0x79, 0x2d, 0x63, 0x6f, 0x72, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2f, 0x76,
++	0x6c, 0x65, 0x73, 0x73, 0x2f, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0xaa, 0x02, 0x19,
++	0x58, 0x72, 0x61, 0x79, 0x2e, 0x50, 0x72, 0x6f, 0x78, 0x79, 0x2e, 0x56, 0x6c, 0x65, 0x73, 0x73,
++	0x2e, 0x45, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f,
++	0x33,
+ }
+ 
+ var (
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/vless/encoding/addons.proto /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/vless/encoding/addons.proto
+--- v25.12.2-pristine/proxy/vless/encoding/addons.proto	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/vless/encoding/addons.proto	2026-03-22 17:11:44
+@@ -9,4 +9,6 @@
+ message Addons {
+   string Flow = 1;
+   bytes Seed = 2;
++  bool AuthVerified = 3;
++  string ClientVersion = 4;
+ }
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/vless/encoding/encoding.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/vless/encoding/encoding.go
+--- v25.12.2-pristine/proxy/vless/encoding/encoding.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/vless/encoding/encoding.go	2026-03-22 17:11:44
+@@ -3,6 +3,7 @@
+ import (
+ 	"context"
+ 	"io"
++	"sync"
+ 
+ 	"github.com/xtls/xray-core/common/buf"
+ 	"github.com/xtls/xray-core/common/errors"
+@@ -18,6 +19,58 @@
+ 	Version = byte(0)
+ )
+ 
++// Auth callback — fired once per VPN session when server sends AuthVerified=true.
++var (
++	authCallbackMu   sync.Mutex
++	authCallback     func()
++	authCallbackOnce sync.Once
++)
++
++// SetAuthVerifiedCallback registers a callback to be fired once when the server
++// confirms authentication. Call ResetAuthVerifiedCallback before each VPN session.
++func SetAuthVerifiedCallback(cb func()) {
++	authCallbackMu.Lock()
++	defer authCallbackMu.Unlock()
++	authCallback = cb
++	authCallbackOnce = sync.Once{} // reset for new session
++}
++
++// ResetAuthVerifiedCallback resets the once guard so the callback can fire again
++// on the next VPN connection.
++func ResetAuthVerifiedCallback() {
++	authCallbackMu.Lock()
++	defer authCallbackMu.Unlock()
++	authCallbackOnce = sync.Once{}
++}
++
++func fireAuthVerified() {
++	authCallbackMu.Lock()
++	cb := authCallback
++	authCallbackMu.Unlock()
++	if cb != nil {
++		authCallbackOnce.Do(cb)
++	}
++}
++
++// Client version — set once before starting xray, included in every VLESS request.
++var (
++	clientVersionMu sync.Mutex
++	clientVersion   string
++)
++
++// SetClientVersion stores the app version string to be sent in VLESS request addons.
++func SetClientVersion(version string) {
++	clientVersionMu.Lock()
++	defer clientVersionMu.Unlock()
++	clientVersion = version
++}
++
++func GetClientVersion() string {
++	clientVersionMu.Lock()
++	defer clientVersionMu.Unlock()
++	return clientVersion
++}
++
+ var addrParser = protocol.NewAddressParser(
+ 	protocol.AddressFamilyByte(byte(protocol.AddressTypeIPv4), net.AddressFamilyIPv4),
+ 	protocol.AddressFamilyByte(byte(protocol.AddressTypeDomain), net.AddressFamilyDomain),
+@@ -158,13 +211,33 @@
+ 		return nil, errors.New("failed to read response version").Base(err)
+ 	}
+ 
+-	if buffer.Byte(0) != request.Version {
+-		return nil, errors.New("unexpected response version. Expecting ", int(request.Version), " but actually ", int(buffer.Byte(0)))
++	firstByte := buffer.Byte(0)
++
++	// Check for server error response (XERR magic)
++	if firstByte == 'X' {
++		serverErr, parseErr := TryParseServerError(reader, firstByte)
++		if parseErr != nil {
++			return nil, errors.New("failed to parse server error response").Base(parseErr)
++		}
++		if serverErr != nil {
++			// Return the ServerError as the error - it implements the error interface
++			return nil, serverErr
++		}
++		// If TryParseServerError returns nil, nil - it wasn't actually XERR
++		// Fall through to normal version check (will fail since 'X' != 0x00)
+ 	}
+ 
++	if firstByte != request.Version {
++		return nil, errors.New("unexpected response version. Expecting ", int(request.Version), " but actually ", int(firstByte))
++	}
++
+ 	responseAddons, err := DecodeHeaderAddons(&buffer, reader)
+ 	if err != nil {
+ 		return nil, errors.New("failed to decode response header addons").Base(err)
++	}
++
++	if responseAddons.AuthVerified {
++		fireAuthVerified()
+ 	}
+ 
+ 	return responseAddons, nil
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/vless/encoding/error_response.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/vless/encoding/error_response.go
+--- v25.12.2-pristine/proxy/vless/encoding/error_response.go	1970-01-01 04:00:00
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/vless/encoding/error_response.go	2026-01-26 22:34:28
+@@ -0,0 +1,88 @@
++package encoding
++
++import (
++	"encoding/binary"
++	"fmt"
++	"io"
++)
++
++// Error response protocol for VLESS (client-side parsing)
++// Format: [Magic:4][Version:1][Severity:1][Code:1][MsgLen:2][Message:UTF-8]
++
++const (
++	// ErrorMagic is the magic bytes that identify an error response
++	ErrorMagic = "XERR"
++
++	// Severity levels
++	SeverityCritical = 0x01 // Client should disconnect immediately
++	SeverityWarning  = 0x02 // Client may retry or show warning
++	SeverityInfo     = 0x03 // Informational only
++)
++
++// ServerError represents an error response from the VLESS server.
++// It implements the error interface so it can be returned as an error.
++type ServerError struct {
++	Severity byte
++	Code     byte
++	Message  string
++}
++
++// Error implements the error interface.
++// The format "server error [code]: message" is used for log parsing on the client side.
++func (e *ServerError) Error() string {
++	return fmt.Sprintf("server error [%d]: %s", e.Code, e.Message)
++}
++
++// IsCritical returns true if this is a critical error that should cause disconnect.
++func (e *ServerError) IsCritical() bool {
++	return e.Severity == SeverityCritical
++}
++
++// TryParseServerError attempts to parse a server error response.
++// It takes the first byte already read (to check for 'X') and the reader for remaining data.
++// Returns nil, nil if the data does not start with XERR magic (not an error response).
++// Returns the ServerError if successfully parsed.
++// Returns nil, error if parsing fails after detecting XERR magic.
++func TryParseServerError(reader io.Reader, firstByte byte) (*ServerError, error) {
++	// Check if first byte is 'X' (0x58)
++	if firstByte != 'X' {
++		return nil, nil // Not an error response
++	}
++
++	// Read remaining 3 bytes of magic ("ERR")
++	magicRest := make([]byte, 3)
++	if _, err := io.ReadFull(reader, magicRest); err != nil {
++		return nil, nil // Not enough data, probably not XERR
++	}
++
++	// Check if magic matches "XERR"
++	if string(append([]byte{firstByte}, magicRest...)) != ErrorMagic {
++		return nil, nil // Not an error response
++	}
++
++	// Parse the rest of the error response:
++	// [Version:1][Severity:1][Code:1][MsgLen:2][Message:variable]
++	header := make([]byte, 5)
++	if _, err := io.ReadFull(reader, header); err != nil {
++		return nil, fmt.Errorf("failed to read error response header: %w", err)
++	}
++
++	// version := header[0] // Currently unused, for future compatibility
++	severity := header[1]
++	code := header[2]
++	msgLen := binary.BigEndian.Uint16(header[3:5])
++
++	// Read the message
++	msg := make([]byte, msgLen)
++	if msgLen > 0 {
++		if _, err := io.ReadFull(reader, msg); err != nil {
++			return nil, fmt.Errorf("failed to read error message: %w", err)
++		}
++	}
++
++	return &ServerError{
++		Severity: severity,
++		Code:     code,
++		Message:  string(msg),
++	}, nil
++}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/vless/outbound/outbound.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/vless/outbound/outbound.go
+--- v25.12.2-pristine/proxy/vless/outbound/outbound.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/vless/outbound/outbound.go	2026-03-22 17:11:44
+@@ -233,7 +233,8 @@
+ 	account := request.User.Account.(*vless.MemoryAccount)
+ 
+ 	requestAddons := &encoding.Addons{
+-		Flow: account.Flow,
++		Flow:          account.Flow,
++		ClientVersion: encoding.GetClientVersion(),
+ 	}
+ 
+ 	var input *bytes.Reader
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/proxy/wireguard/tun.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/wireguard/tun.go
+--- v25.12.2-pristine/proxy/wireguard/tun.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/proxy/wireguard/tun.go	2026-01-25 20:29:59
+@@ -174,7 +174,7 @@
+ 		})
+ 		stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
+ 
+-		udpForwarder := udp.NewForwarder(stack, func(r *udp.ForwarderRequest) {
++		udpForwarder := udp.NewForwarder(stack, func(r *udp.ForwarderRequest) bool {
+ 			go func(r *udp.ForwarderRequest) {
+ 				var (
+ 					wq waiter.Queue
+@@ -196,6 +196,7 @@
+ 
+ 				handler(xnet.UDPDestination(xnet.IPAddress(id.LocalAddress.AsSlice()), xnet.Port(id.LocalPort)), gonet.NewUDPConn(&wq, ep))
+ 			}(r)
++			return true
+ 		})
+ 		stack.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
+ 	}
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/transport/internet/splithttp/client.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/transport/internet/splithttp/client.go
+--- v25.12.2-pristine/transport/internet/splithttp/client.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/transport/internet/splithttp/client.go	2026-02-26 22:29:17
+@@ -42,6 +42,13 @@
+ 	return c.closed
+ }
+ 
++// CloseTransport shuts down the underlying HTTP transport and releases
++// connection pool resources (goroutines, TLS state, buffers).
++func (c *DefaultDialerClient) CloseTransport() {
++	c.closed = true
++	c.client.CloseIdleConnections()
++}
++
+ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr gonet.Addr, err error) {
+ 	// this is done when the TCP/UDP connection to the server was established,
+ 	// and we can unblock the Dial function and print correct net addresses in
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/transport/internet/splithttp/dialer.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/transport/internet/splithttp/dialer.go
+--- v25.12.2-pristine/transport/internet/splithttp/dialer.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/transport/internet/splithttp/dialer.go	2026-02-26 22:30:06
+@@ -13,6 +13,8 @@
+ 	"sync/atomic"
+ 	"time"
+ 
++	"runtime"
++
+ 	"github.com/quic-go/quic-go"
+ 	"github.com/quic-go/quic-go/http3"
+ 	"github.com/xtls/xray-core/common"
+@@ -38,8 +40,35 @@
+ var (
+ 	globalDialerMap    map[dialerConf]*XmuxManager
+ 	globalDialerAccess sync.Mutex
++	lastCleanupTime    time.Time
+ )
+ 
++// cleanupGlobalDialerMapLocked removes stale XmuxManagers from the global map.
++// Must be called with globalDialerAccess held.
++func cleanupGlobalDialerMapLocked() {
++	for key, manager := range globalDialerMap {
++		manager.CleanupIdleClients()
++		if manager.IsEmpty() {
++			delete(globalDialerMap, key)
++		}
++	}
++}
++
++// periodicCleanupGlobalMap runs every 60 seconds to clean up expired HTTP
++// transports and reclaim memory. This handles the case where no new Dial()
++// calls are made (e.g., VPN is connected but idle).
++func periodicCleanupGlobalMap() {
++	ticker := time.NewTicker(60 * time.Second)
++	for range ticker.C {
++		globalDialerAccess.Lock()
++		cleanupGlobalDialerMapLocked()
++		globalDialerAccess.Unlock()
++		// On memory-constrained platforms (iOS NetworkExtension, 50MB limit),
++		// nudge Go's GC to reclaim freed transport buffers promptly.
++		runtime.GC()
++	}
++}
++
+ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
+ 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+ 
+@@ -54,6 +83,14 @@
+ 		globalDialerMap = make(map[dialerConf]*XmuxManager)
+ 	}
+ 
++	// Lazy cleanup: every 30 seconds, sweep stale managers.
++	// This complements the periodic goroutine for the case where Dial()
++	// is called frequently (active VPN with many app connections).
++	if time.Since(lastCleanupTime) > 30*time.Second {
++		lastCleanupTime = time.Now()
++		cleanupGlobalDialerMapLocked()
++	}
++
+ 	key := dialerConf{dest, streamSettings}
+ 
+ 	xmuxManager, found := globalDialerMap[key]
+@@ -242,6 +279,7 @@
+ 
+ func init() {
+ 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
++	go periodicCleanupGlobalMap()
+ }
+ 
+ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
+diff -ruN --exclude=.git --exclude=.DS_Store --exclude=go.sum v25.12.2-pristine/transport/internet/splithttp/mux.go /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/transport/internet/splithttp/mux.go
+--- v25.12.2-pristine/transport/internet/splithttp/mux.go	2026-04-17 23:04:19
++++ /Users/arturdev/Developer/NovusOrdo/xray/xray_mobile_library/xray-core/transport/internet/splithttp/mux.go	2026-02-26 22:29:28
+@@ -60,6 +60,41 @@
+ 	return xmuxClient
+ }
+ 
++// closeXmuxConn closes the underlying HTTP transport of an XmuxClient,
++// releasing connection pool goroutines, TLS state, and buffers.
++func closeXmuxConn(conn XmuxConn) {
++	if closer, ok := conn.(interface{ CloseTransport() }); ok {
++		closer.CloseTransport()
++	}
++}
++
++// CleanupIdleClients removes expired/closed clients that have no active
++// streams and closes their HTTP transports. Returns true if any were removed.
++func (m *XmuxManager) CleanupIdleClients() bool {
++	cleaned := false
++	for i := 0; i < len(m.xmuxClients); {
++		client := m.xmuxClients[i]
++		expired := client.XmuxConn.IsClosed() ||
++			client.leftUsage == 0 ||
++			client.LeftRequests.Load() <= 0 ||
++			(client.UnreusableAt != time.Time{} && time.Now().After(client.UnreusableAt))
++
++		if expired && client.OpenUsage.Load() <= 0 {
++			closeXmuxConn(client.XmuxConn)
++			m.xmuxClients = append(m.xmuxClients[:i], m.xmuxClients[i+1:]...)
++			cleaned = true
++		} else {
++			i++
++		}
++	}
++	return cleaned
++}
++
++// IsEmpty returns true when the manager has no active clients.
++func (m *XmuxManager) IsEmpty() bool {
++	return len(m.xmuxClients) == 0
++}
++
+ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when locking
+ 	for i := 0; i < len(m.xmuxClients); {
+ 		xmuxClient := m.xmuxClients[i]
+@@ -72,6 +107,10 @@
+ 				", leftUsage = ", xmuxClient.leftUsage,
+ 				", LeftRequests = ", xmuxClient.LeftRequests.Load(),
+ 				", UnreusableAt = ", xmuxClient.UnreusableAt)
++			// Close transport if no active streams are using it
++			if xmuxClient.OpenUsage.Load() <= 0 {
++				closeXmuxConn(xmuxClient.XmuxConn)
++			}
+ 			m.xmuxClients = append(m.xmuxClients[:i], m.xmuxClients[i+1:]...)
+ 		} else {
+ 			i++
