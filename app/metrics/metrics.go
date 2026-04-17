@@ -77,6 +77,8 @@ func NewMetricsHandler(ctx context.Context, config *Config) (*MetricsHandler, er
 		}
 		return resp
 	}))
+	// CUSTOM: register /online and /online-users HTTP endpoints (see online_endpoints.go)
+	registerOnlineEndpoints(c)
 	return c, nil
 }
 

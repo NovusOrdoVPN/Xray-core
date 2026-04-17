@@ -26,4 +26,9 @@ message Config {
   int64 seconds_from = 5;
   int64 seconds_to = 6;
   string padding = 7;
+  // CUSTOM: validator selects the validator implementation: "" / "default" (memory),
+  // "remote" (tower HTTP), or "relay" (passthrough, no auth).
+  string validator = 8;
+  // CUSTOM: validator_endpoint — HTTP URL for the remote validator (required when validator="remote").
+  string validator_endpoint = 9;
 }

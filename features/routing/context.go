@@ -41,7 +41,9 @@ type Context interface {
 	// GetUser returns the user email from the connection content, if exists.
 	GetUser() string
 
-	// GetVlessRoute returns the user-sent VLESS UUID's 7th<<8 | 8th bytes, if exists.
+	// CUSTOM: VlessRoute byte range is [8:10] in the fork, not upstream's [6:8]
+	// (see common/session/session.go for rationale).
+	// GetVlessRoute returns the user-sent VLESS UUID's 9th<<8 | 10th bytes (group 4), if exists.
 	GetVlessRoute() net.Port
 
 	// GetAttributes returns extra attributes from the conneciont content.

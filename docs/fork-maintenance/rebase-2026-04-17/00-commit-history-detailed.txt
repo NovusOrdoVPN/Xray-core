@@ -1,0 +1,132 @@
+=== a50e76b1 handling remote validator ===
+ infra/conf/vless.go                     |  14 ++--
+ proxy/vless/inbound/config.pb.go        |  55 ++++++++++-----
+ proxy/vless/inbound/config.proto        |   2 +
+ proxy/vless/inbound/inbound.go          |  14 +++-
+ proxy/vless/inbound/validator_remote.go | 120 ++++++++++++++++++++++++++++++++
+ 5 files changed, 182 insertions(+), 23 deletions(-)
+
+=== 8836ac40 allowing all clients to connect per requested flow in vless ===
+ .github/workflows/release.yml           |  8 ++++----
+ proxy/vless/inbound/inbound.go          |  8 ++++++--
+ proxy/vless/inbound/validator_remote.go | 24 +++++++++++++++++-------
+ 3 files changed, 27 insertions(+), 13 deletions(-)
+
+=== c516e3a7 Merge pull request #1 from arturdev/feat_wildcard_clients ===
+=== ddb9a4dd added logs ===
+ proxy/vless/inbound/inbound.go          | 3 +++
+ proxy/vless/inbound/validator_remote.go | 8 ++++++++
+ 2 files changed, 11 insertions(+)
+
+=== 102a0894 Merge pull request #2 from arturdev/feat_wildcard_clients ===
+=== 51becae6 nitifying connect and disconnect events ===
+ core/core.go                            |  2 +-
+ proxy/vless/inbound/inbound.go          |  7 ++++
+ proxy/vless/inbound/validator_remote.go | 58 +++++++++++++++++++++++++++------
+ 3 files changed, 56 insertions(+), 11 deletions(-)
+
+=== 5dcc6de6 Merge pull request #3 from arturdev/event_notify ===
+=== 9c52e5d9 fix ===
+ core/core.go                            |   2 +-
+ proxy/vless/inbound/validator_remote.go | 298 +++++++++++++++++++++++---------
+ 2 files changed, 215 insertions(+), 85 deletions(-)
+
+=== 81581586 Merge pull request #4 from arturdev/event_notify ===
+=== b221b5b6 fix broken code ===
+ proxy/vless/inbound/inbound.go | 7 -------
+ 1 file changed, 7 deletions(-)
+
+=== 6f40a69b Merge pull request #5 from arturdev/fix_error ===
+=== e7898516 responding custom errors from remote validator to client. ===
+ core/core.go                            |  2 +-
+ proxy/vless/encoding/encoding.go        | 20 +++++++-
+ proxy/vless/encoding/error_response.go  | 88 +++++++++++++++++++++++++++++++++
+ proxy/vless/inbound/error_response.go   | 81 ++++++++++++++++++++++++++++++
+ proxy/vless/inbound/inbound.go          | 20 ++++++++
+ proxy/vless/inbound/validator_remote.go | 59 +++++++++++++++-------
+ 6 files changed, 249 insertions(+), 21 deletions(-)
+
+=== 6f11bf98 Merge pull request #6 from NovusOrdoVPN/custom_errors ===
+=== 73e80238 added logs ===
+ core/core.go                            |  2 +-
+ proxy/vless/inbound/inbound.go          | 21 +++++++++++++--------
+ proxy/vless/inbound/validator_remote.go |  9 +++++++++
+ 3 files changed, 23 insertions(+), 9 deletions(-)
+
+=== 120a2302 fixed issues ===
+ core/core.go                     | 2 +-
+ proxy/vless/encoding/encoding.go | 3 ++-
+ proxy/vless/inbound/inbound.go   | 9 +++++----
+ 3 files changed, 8 insertions(+), 6 deletions(-)
+
+=== 2a6a7d23 removing logs ===
+ proxy/vless/inbound/inbound.go          | 1 -
+ proxy/vless/inbound/validator_remote.go | 9 ---------
+ 2 files changed, 10 deletions(-)
+
+=== b75944b0 bump version ===
+ core/core.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+=== 9197c9c7 Add AuthVerified field to VLESS response Addons ===
+ proxy/vless/encoding/addons.go    |  6 +++---
+ proxy/vless/encoding/addons.pb.go | 34 ++++++++++++++++++++++------------
+ proxy/vless/encoding/addons.proto |  1 +
+ proxy/vless/inbound/inbound.go    |  1 +
+ 4 files changed, 27 insertions(+), 15 deletions(-)
+
+=== 812834ad added client version addon ===
+ proxy/vless/encoding/addons.pb.go       | 35 ++++++++++++++++++++++-----------
+ proxy/vless/encoding/addons.proto       |  1 +
+ proxy/vless/encoding/encoding.go        | 12 ++++++-----
+ proxy/vless/inbound/validator_remote.go | 17 +++++++++++-----
+ proxy/vless/validator.go                |  8 ++++++++
+ 5 files changed, 51 insertions(+), 22 deletions(-)
+
+=== be85f3ec updated version ===
+ core/core.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+=== 12159047 version fix ===
+ core/core.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+=== d5723c75 Add global online user count stats via metrics endpoint ===
+ app/dispatcher/default.go               | 21 +++++++++++++++++----
+ app/metrics/metrics.go                  | 12 ++++++++++++
+ app/stats/stats.go                      | 12 ++++++++++++
+ core/core.go                            |  2 +-
+ proxy/vless/inbound/validator_remote.go |  1 +
+ 5 files changed, 43 insertions(+), 5 deletions(-)
+
+=== 314fdffa Add /online endpoint and filter per-user maps from metrics ===
+ app/metrics/metrics.go | 26 +++++++++++++++++++++++++-
+ core/core.go           |  2 +-
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+
+=== 546bf632 Fix stale online count: trigger cleanup before returning Count() ===
+ app/stats/online_map.go | 5 ++++-
+ core/core.go            | 2 +-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+=== 6d69b943 Add deduplicated online users metrics endpoint ===
+ .gitignore                |  3 ++
+ app/dispatcher/default.go | 57 ++++++++++++++++++-----------
+ app/metrics/metrics.go    | 92 +++++++++++++++++++++++++++++++++++++++++++++++
+ app/stats/online_map.go   | 10 +++++-
+ 4 files changed, 141 insertions(+), 21 deletions(-)
+
+=== 8be3ea90 Bump version to 25.12.104 ===
+ core/core.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+=== 2d652365 Add relay mode to VLESS inbound/outbound for country-based routing ===
+ common/session/session.go              |  8 +++++++-
+ features/routing/context.go            |  2 +-
+ infra/conf/vless.go                    |  2 ++
+ proxy/vless/inbound/inbound.go         | 14 +++++++++++++-
+ proxy/vless/inbound/validator_relay.go | 35 ++++++++++++++++++++++++++++++++++
+ proxy/vless/outbound/config.pb.go      | 30 +++++++++++++++++++----------
+ proxy/vless/outbound/config.proto      |  1 +
+ proxy/vless/outbound/outbound.go       | 26 ++++++++++++++++++++++++-
+ 8 files changed, 104 insertions(+), 14 deletions(-)

@@ -1,0 +1,27 @@
+a50e76b1 handling remote validator
+8836ac40 allowing all clients to connect per requested flow in vless
+c516e3a7 Merge pull request #1 from arturdev/feat_wildcard_clients
+ddb9a4dd added logs
+102a0894 Merge pull request #2 from arturdev/feat_wildcard_clients
+51becae6 nitifying connect and disconnect events
+5dcc6de6 Merge pull request #3 from arturdev/event_notify
+9c52e5d9 fix
+81581586 Merge pull request #4 from arturdev/event_notify
+b221b5b6 fix broken code
+6f40a69b Merge pull request #5 from arturdev/fix_error
+e7898516 responding custom errors from remote validator to client.
+6f11bf98 Merge pull request #6 from NovusOrdoVPN/custom_errors
+73e80238 added logs
+120a2302 fixed issues
+2a6a7d23 removing logs
+b75944b0 bump version
+9197c9c7 Add AuthVerified field to VLESS response Addons
+812834ad added client version addon
+be85f3ec updated version
+12159047 version fix
+d5723c75 Add global online user count stats via metrics endpoint
+314fdffa Add /online endpoint and filter per-user maps from metrics
+546bf632 Fix stale online count: trigger cleanup before returning Count()
+6d69b943 Add deduplicated online users metrics endpoint
+8be3ea90 Bump version to 25.12.104
+2d652365 Add relay mode to VLESS inbound/outbound for country-based routing

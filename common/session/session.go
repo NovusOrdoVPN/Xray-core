@@ -47,8 +47,16 @@ type Inbound struct {
 	Name string
 	// User is the user that authenticates for the inbound. May be nil if the protocol allows anonymous traffic.
 	User *protocol.MemoryUser
-	// VlessRoute is the user-sent VLESS UUID's 7th<<8 | 8th bytes.
+	// CUSTOM: VlessRoute byte range overridden from upstream's [6:8] to [8:10]
+	// so the routing bits survive ProcessUUID()'s zeroing of bytes 6-7 during auth.
+	// VlessRoute is the user-sent VLESS UUID's 9th<<8 | 10th bytes (group 4).
 	VlessRoute net.Port
+	// CUSTOM: RelayUUID holds the raw 16-byte UUID sent by the client, captured by
+	// VLESS inbound when validator is "relay" so outbound can forward it to the exit.
+	RelayUUID []byte
+	// CUSTOM: RelayClientVersion holds the client's version string from VLESS addons,
+	// captured alongside RelayUUID for relay-mode outbound passthrough.
+	RelayClientVersion string
 	// Used by splice copy. Conn is actually internet.Connection. May be nil.
 	Conn net.Conn
 	// Used by splice copy. Timer of the inbound buf copier. May be nil.

@@ -10,4 +10,8 @@ import "common/protocol/server_spec.proto";
 
 message Config {
   xray.common.protocol.ServerEndpoint vnext = 1;
+  // CUSTOM: relay mode — forward the client's original UUID and ClientVersion to
+  // the exit server instead of the configured account, for country-based routing
+  // on Yandex Cloud relay fleet (replaces HAProxy).
+  bool relay = 2;
 }

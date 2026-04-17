@@ -15,8 +15,14 @@ import (
 )
 
 func EncodeHeaderAddons(buffer *buf.Buffer, addons *Addons) error {
-	switch addons.Flow {
-	case vless.XRV:
+	// CUSTOM-BEGIN: encoder triggers on AuthVerified/ClientVersion too
+	// Encode as protobuf whenever any addon field is non-default.
+	// AuthVerified (server→client) and ClientVersion (client→server) require the
+	// protobuf payload to reach the peer; without this they'd be dropped because
+	// upstream's original encoder only triggered on Flow == XRV.
+	needsProtobuf := addons.Flow == vless.XRV || addons.AuthVerified || addons.ClientVersion != ""
+	// CUSTOM-END
+	if needsProtobuf {
 		bytes, err := proto.Marshal(addons)
 		if err != nil {
 			return errors.New("failed to marshal addons protobuf value").Base(err)
@@ -27,7 +33,7 @@ func EncodeHeaderAddons(buffer *buf.Buffer, addons *Addons) error {
 		if _, err := buffer.Write(bytes); err != nil {
 			return errors.New("failed to write addons protobuf value").Base(err)
 		}
-	default:
+	} else {
 		if err := buffer.WriteByte(0); err != nil {
 			return errors.New("failed to write addons protobuf length").Base(err)
 		}

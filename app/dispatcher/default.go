@@ -158,9 +158,13 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		user = sessionInbound.User
 	}
 
-	if user != nil && len(user.Email) > 0 {
+	// CUSTOM-BEGIN: outer guard relaxed to allow email-less users (relay synthetic users)
+	// Email-specific traffic counters and per-user online map remain gated on email.
+	// Per-inbound online map (see custom_online.go) uses UUID identity and always fires
+	// when sessionInbound is present, enabling admin portal to count relay-mode users.
+	if user != nil {
 		p := d.policy.ForLevel(user.Level)
-		if p.Stats.UserUplink {
+		if len(user.Email) > 0 && p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
 				inboundLink.Writer = &SizeStatWriter{
@@ -169,7 +173,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 				}
 			}
 		}
-		if p.Stats.UserDownlink {
+		if len(user.Email) > 0 && p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
 				outboundLink.Writer = &SizeStatWriter{
@@ -180,9 +184,16 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		}
 
 		if p.Stats.UserOnline {
-			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
+			if sessionInbound != nil {
+				if len(user.Email) > 0 {
+					trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
+				}
+				// CUSTOM: per-inbound online tracking (helpers in custom_online.go).
+				trackInboundOnline(ctx, d.stats, sessionInbound.Tag, userOnlineIdentity(user))
+			}
 		}
 	}
+	// CUSTOM-END
 
 	return inboundLink, outboundLink
 }
@@ -196,15 +207,16 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 
 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
 
-	if user != nil && len(user.Email) > 0 {
+	// CUSTOM-BEGIN: mirror of getLink() — allow email-less users, register per-inbound online.
+	if user != nil {
 		p := policyManager.ForLevel(user.Level)
-		if p.Stats.UserUplink {
+		if len(user.Email) > 0 && p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, _ := stats.GetOrRegisterCounter(statsManager, name); c != nil {
 				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
 			}
 		}
-		if p.Stats.UserDownlink {
+		if len(user.Email) > 0 && p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, _ := stats.GetOrRegisterCounter(statsManager, name); c != nil {
 				link.Writer = &SizeStatWriter{
@@ -214,9 +226,16 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 			}
 		}
 		if p.Stats.UserOnline {
-			trackOnlineIP(ctx, statsManager, user.Email, sessionInbound.Source.Address.String())
+			if sessionInbound != nil {
+				if len(user.Email) > 0 {
+					trackOnlineIP(ctx, statsManager, user.Email, sessionInbound.Source.Address.String())
+				}
+				// CUSTOM: per-inbound online tracking (helpers in custom_online.go).
+				trackInboundOnline(ctx, statsManager, sessionInbound.Tag, userOnlineIdentity(user))
+			}
 		}
 	}
+	// CUSTOM-END
 
 	return link
 }

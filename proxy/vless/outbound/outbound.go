@@ -55,6 +55,8 @@ type Handler struct {
 	cone          bool
 	encryption    *encryption.ClientInstance
 	reverse       *Reverse
+	// CUSTOM: relay mode — forward inbound's original UUID/ClientVersion to the exit.
+	relay bool
 
 	testpre  uint32
 	initpre  sync.Once
@@ -81,6 +83,8 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		cone:          ctx.Value("cone").(bool),
+		// CUSTOM: relay mode flag from proto config.
+		relay: config.GetRelay(),
 	}
 
 	a := handler.server.User.Account.(*vless.MemoryAccount)
@@ -231,9 +235,32 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}
 
+	// CUSTOM-BEGIN: relay-mode UUID/ClientVersion override
+	// In relay mode, override the configured account with the original client's
+	// UUID (captured by VLESS inbound when validator is "relay") and forward
+	// their ClientVersion so the exit server can validate both.
+	user := rec.User
+	var relayClientVersion string
+	if h.relay {
+		ib := session.InboundFromContext(ctx)
+		if ib != nil && len(ib.RelayUUID) == 16 {
+			var relayID [16]byte
+			copy(relayID[:], ib.RelayUUID)
+			account := rec.User.Account.(*vless.MemoryAccount)
+			user = &protocol.MemoryUser{
+				Account: &vless.MemoryAccount{ID: protocol.NewID(relayID), Flow: account.Flow},
+				Level:   rec.User.Level,
+			}
+			relayClientVersion = ib.RelayClientVersion
+		} else {
+			errors.LogDebug(ctx, "relay outbound: no RelayUUID in inbound context — falling back to configured UUID (possible misconfig or non-VLESS inbound)")
+		}
+	}
+	// CUSTOM-END
+
 	request := &protocol.RequestHeader{
 		Version: encoding.Version,
-		User:    rec.User,
+		User:    user,
 		Command: command,
 		Address: target.Address,
 		Port:    target.Port,
@@ -243,6 +270,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	requestAddons := &encoding.Addons{
 		Flow: account.Flow,
+	}
+	// CUSTOM: propagate original client's version to exit server in relay mode.
+	if relayClientVersion != "" {
+		requestAddons.ClientVersion = relayClientVersion
 	}
 
 	var input *bytes.Reader

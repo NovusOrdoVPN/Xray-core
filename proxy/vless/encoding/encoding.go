@@ -10,7 +10,6 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/vless"
 )
@@ -91,19 +90,31 @@ func DecodeRequestHeader(isfb bool, first *buf.Buffer, reader io.Reader, validat
 			copy(id[:], buffer.Bytes())
 		}
 
-		if request.User = validator.Get(id); request.User == nil {
-			u := uuid.UUID(id)
-			return nil, nil, nil, isfb, errors.New("invalid request user id: " + u.String())
-		}
-
 		if isfb {
 			first.Advance(17)
 		}
 
+		// CUSTOM-BEGIN: decode-order + MetaValidator
+		// Decode addons BEFORE validator.Get() so ClientVersion is available
+		// for the very first tower validation call (remote validator feature).
 		requestAddons, err := DecodeHeaderAddons(&buffer, reader)
 		if err != nil {
 			return nil, nil, nil, false, errors.New("failed to decode request header addons").Base(err)
 		}
+
+		// If the validator implements the optional MetaValidator interface, pass
+		// the client version along; otherwise fall back to upstream's Get(id).
+		// Return id[:] on failure so the inbound handler can look up tower's
+		// error details and respond with an XERR protocol message.
+		if mv, ok := validator.(vless.MetaValidator); ok {
+			request.User = mv.GetWithMeta(id, requestAddons.GetClientVersion())
+		} else {
+			request.User = validator.Get(id)
+		}
+		if request.User == nil {
+			return id[:], nil, nil, false, errors.New("invalid request user id")
+		}
+		// CUSTOM-END: decode-order + MetaValidator
 
 		buffer.Clear()
 		if _, err := buffer.ReadFullFrom(reader, 1); err != nil {
@@ -160,8 +171,27 @@ func DecodeResponseHeader(reader io.Reader, request *protocol.RequestHeader) (*A
 		return nil, errors.New("failed to read response version").Base(err)
 	}
 
-	if buffer.Byte(0) != request.Version {
-		return nil, errors.New("unexpected response version. Expecting ", int(request.Version), " but actually ", int(buffer.Byte(0)))
+	firstByte := buffer.Byte(0)
+
+	// CUSTOM-BEGIN: XERR structured error response detection
+	// Check for server error response (XERR magic). When present, parse it and
+	// surface as an error the client can display; otherwise fall through.
+	if firstByte == 'X' {
+		serverErr, parseErr := TryParseServerError(reader, firstByte)
+		if parseErr != nil {
+			return nil, errors.New("failed to parse server error response").Base(parseErr)
+		}
+		if serverErr != nil {
+			// ServerError implements the error interface.
+			return nil, serverErr
+		}
+		// TryParseServerError returns (nil, nil) when magic wasn't actually XERR.
+		// Fall through to normal version check.
+	}
+	// CUSTOM-END: XERR
+
+	if firstByte != request.Version {
+		return nil, errors.New("unexpected response version. Expecting ", int(request.Version), " but actually ", int(firstByte))
 	}
 
 	responseAddons, err := DecodeHeaderAddons(&buffer, reader)

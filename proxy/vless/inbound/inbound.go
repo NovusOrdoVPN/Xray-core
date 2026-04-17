@@ -26,6 +26,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features"
 	"github.com/xtls/xray-core/features/dns"
@@ -68,7 +69,26 @@ func init() {
 			}
 		}
 
-		return New(ctx, c, dc, validator)
+		// CUSTOM-BEGIN: validator selection (remote tower / relay passthrough)
+		var selectedValidator vless.Validator = validator
+		switch strings.ToLower(c.Validator) {
+		case "", "default":
+			errors.LogInfo(ctx, "vless inbound using default memory validator")
+		case "remote":
+			if c.ValidatorEndpoint == "" {
+				return nil, errors.New("validatorEndpoint is required when validator is remote").AtError()
+			}
+			selectedValidator = newRemoteValidator(validator, c.ValidatorEndpoint)
+			errors.LogInfo(ctx, "vless inbound using remote validator at ", c.ValidatorEndpoint)
+		case "relay":
+			selectedValidator = &relayValidator{}
+			errors.LogInfo(ctx, "vless inbound using relay passthrough validator (no auth)")
+		default:
+			return nil, errors.New("unknown validator option: ", c.Validator).AtError()
+		}
+		// CUSTOM-END
+
+		return New(ctx, c, dc, selectedValidator)
 	}))
 }
 
@@ -307,8 +327,36 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	if isfb && firstLen < 18 {
 		err = errors.New("fallback directly")
 	} else {
+		// CUSTOM: diagnostic log — reveals which validator implementation is active (default/remote/relay).
+		errors.LogInfo(ctx, "decoding VLESS request header with validator ", reflect.TypeOf(h.validator))
 		userSentID, request, requestAddons, isfb, err = encoding.DecodeRequestHeader(isfb, first, reader, h.validator)
 	}
+
+	// CUSTOM-BEGIN: XERR structured error response
+	// When the remote validator rejects a UUID, send a structured error back to
+	// the client (magic + code + message) instead of just dropping the connection,
+	// so the client can show meaningful messages like "subscription expired".
+	if err != nil && strings.Contains(err.Error(), "invalid request user id") {
+		if remoteVal, ok := h.validator.(*remoteValidator); ok {
+			if len(userSentID) == 16 {
+				var id uuid.UUID
+				copy(id[:], userSentID)
+				code, msg := remoteVal.GetLastError(id)
+				// Use default error if tower didn't provide specific details.
+				if code == 0 {
+					code = ErrInvalidUUID
+					msg = "Invalid or unknown user ID"
+				}
+				severity := GetSeverityForCode(code)
+				if sendErr := SendErrorResponse(connection, severity, byte(code), msg); sendErr != nil {
+					errors.LogWarningInner(ctx, sendErr, "failed to send XERR error response")
+				} else {
+					errors.LogInfo(ctx, "sent XERR error response: code=", code, " msg=", msg)
+				}
+			}
+		}
+	}
+	// CUSTOM-END: XERR
 
 	if err != nil {
 		if isfb {
@@ -535,7 +583,23 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 	inbound.Name = "vless"
 	inbound.User = request.User
-	inbound.VlessRoute = net.PortFromBytes(userSentID[6:8])
+	// CUSTOM-BEGIN: VlessRoute byte range override (fork uses [8:10], upstream uses [6:8])
+	// so ProcessUUID()'s zeroing of bytes 6-7 doesn't destroy routing info.
+	inbound.VlessRoute = net.PortFromBytes(userSentID[8:10])
+	// CUSTOM-END
+	// CUSTOM-BEGIN: relay-mode UUID/ClientVersion passthrough
+	// When the relay validator is active, capture the original UUID and ClientVersion
+	// so the outbound (with "relay": true) can forward them to the exit server.
+	if _, isRelay := h.validator.(*relayValidator); isRelay {
+		if len(userSentID) == 16 {
+			inbound.RelayUUID = make([]byte, 16)
+			copy(inbound.RelayUUID, userSentID)
+		}
+		if requestAddons != nil {
+			inbound.RelayClientVersion = requestAddons.GetClientVersion()
+		}
+	}
+	// CUSTOM-END
 
 	account := request.User.Account.(*vless.MemoryAccount)
 
@@ -545,13 +609,17 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	responseAddons := &encoding.Addons{
 		// Flow: requestAddons.Flow,
+		// CUSTOM: signal successful auth to client (remote validator feature).
+		AuthVerified: true,
 	}
 
 	var input *bytes.Reader
 	var rawInput *bytes.Buffer
 	switch requestAddons.Flow {
 	case vless.XRV:
-		if account.Flow == requestAddons.Flow {
+		// CUSTOM: wildcard flow — accept any client flow when account.Flow is empty
+		// (needed for relay-mode users where the exit performs the real flow match).
+		if account.Flow == "" || account.Flow == requestAddons.Flow {
 			inbound.CanSpliceCopy = 2
 			switch request.Command {
 			case protocol.RequestCommandUDP:
@@ -594,7 +662,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			return errors.New("account " + account.ID.String() + " is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.").AtWarning()
 		}
 	default:
-		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
+		// CUSTOM: wildcard flow default branch — accept unknown flows for wildcard
+		// accounts (account.Flow == "") so relay-mode doesn't reject valid clients.
+		if account.Flow == "" {
+			inbound.CanSpliceCopy = 3
+		} else {
+			return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
+		}
 	}
 
 	if request.Command != protocol.RequestCommandMux {

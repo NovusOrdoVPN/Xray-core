@@ -34,7 +34,10 @@ type VLessInboundConfig struct {
 	Decryption string                  `json:"decryption"`
 	Fallbacks  []*VLessInboundFallback `json:"fallbacks"`
 	Flow       string                  `json:"flow"`
-	Testseed   []uint32                `json:"testseed"`
+	// CUSTOM: Validator selects memory / remote / relay. See proto config.proto.
+	Validator         string   `json:"validator"`
+	ValidatorEndpoint string   `json:"validatorEndpoint"`
+	Testseed          []uint32 `json:"testseed"`
 }
 
 // Build implements Buildable
@@ -199,6 +202,10 @@ func (c *VLessInboundConfig) Build() (proto.Message, error) {
 		}
 	}
 
+	// CUSTOM: propagate Validator/ValidatorEndpoint to proto config (remote validator feature).
+	config.Validator = c.Validator
+	config.ValidatorEndpoint = c.ValidatorEndpoint
+
 	return config, nil
 }
 
@@ -239,10 +246,12 @@ type VLessOutboundConfig struct {
 	Flow       string                `json:"flow"`
 	Seed       string                `json:"seed"`
 	Encryption string                `json:"encryption"`
-	Reverse    *VLessReverseConfig   `json:"reverse"`
-	Testpre    uint32                `json:"testpre"`
-	Testseed   []uint32              `json:"testseed"`
-	Vnext      []*VLessOutboundVnext `json:"vnext"`
+	Reverse  *VLessReverseConfig   `json:"reverse"`
+	Testpre  uint32                `json:"testpre"`
+	Testseed []uint32              `json:"testseed"`
+	Vnext    []*VLessOutboundVnext `json:"vnext"`
+	// CUSTOM: Relay enables the relay-mode outbound (forwards client UUID/ClientVersion to exit server).
+	Relay bool `json:"relay"`
 }
 
 // Build implements Buildable
@@ -369,6 +378,9 @@ func (c *VLessOutboundConfig) Build() (proto.Message, error) {
 		config.Vnext = spec
 		break
 	}
+
+	// CUSTOM: propagate relay flag to proto config (relay mode feature).
+	config.Relay = c.Relay
 
 	return config, nil
 }

@@ -1,0 +1,1609 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 80ed94d3..ac2509cf 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -190,7 +190,7 @@ jobs:
+           COMMID=$(git describe --always --dirty)
+           if [[ ${GOOS} == 'windows' ]]; then
+             echo 'Building Xray for Windows...'
+-            go build -o build_assets/xray.exe -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
++            go build -o build_assets/xray.exe -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=arturdev-${COMMID} -s -w -buildid=" -v ./main
+             echo 'CreateObject("Wscript.Shell").Run "xray.exe -config config.json",0' > build_assets/xray_no_window.vbs
+             echo 'Start-Process -FilePath ".\xray.exe" -ArgumentList "-config .\config.json" -WindowStyle Hidden' > build_assets/xray_no_window.ps1
+             # The line below is for without running conhost.exe version. Commented for not being used. Provided for reference.
+@@ -198,11 +198,11 @@ jobs:
+           else
+             echo 'Building Xray...'
+             if [[ ${GOARCH} == 'mips' || ${GOARCH} == 'mipsle' ]]; then
+-              go build -o build_assets/xray -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
++              go build -o build_assets/xray -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=arturdev-${COMMID} -s -w -buildid=" -v ./main
+               echo 'Building soft-float Xray for MIPS/MIPSLE 32-bit...'
+-              GOMIPS=softfloat go build -o build_assets/xray_softfloat -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
++              GOMIPS=softfloat go build -o build_assets/xray_softfloat -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=arturdev-${COMMID} -s -w -buildid=" -v ./main
+             else
+-              go build -o build_assets/xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
++              go build -o build_assets/xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=arturdev-${COMMID} -s -w -buildid=" -v ./main
+             fi
+           fi
+ 
+diff --git a/.gitignore b/.gitignore
+index f1eca817..95cdcaba 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -56,6 +56,9 @@ errorgen
+ # Coverage reports
+ coverage.*
+ 
++# Local Go build cache used for sandboxed test runs
++.gocache/
++
+ # Node modules (in case of frontend assets)
+ node_modules/
+ 
+diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
+index 2ae64902..acbede09 100644
+--- a/app/dispatcher/default.go
++++ b/app/dispatcher/default.go
+@@ -21,12 +21,23 @@ import (
+ 	"github.com/xtls/xray-core/features/routing"
+ 	routing_session "github.com/xtls/xray-core/features/routing/session"
+ 	"github.com/xtls/xray-core/features/stats"
++	"github.com/xtls/xray-core/proxy/vless"
+ 	"github.com/xtls/xray-core/transport"
+ 	"github.com/xtls/xray-core/transport/pipe"
+ )
+ 
+ var errSniffingTimeout = errors.New("timeout on sniffing")
+ 
++func userOnlineIdentity(user *protocol.MemoryUser) string {
++	if user == nil {
++		return ""
++	}
++	if account, ok := user.Account.(*vless.MemoryAccount); ok && account.ID != nil {
++		return account.ID.String()
++	}
++	return user.Email
++}
++
+ type cachedReader struct {
+ 	sync.Mutex
+ 	reader buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
+@@ -159,9 +170,10 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+ 		user = sessionInbound.User
+ 	}
+ 
+-	if user != nil && len(user.Email) > 0 {
++	if user != nil {
++		onlineIdentity := userOnlineIdentity(user)
+ 		p := d.policy.ForLevel(user.Level)
+-		if p.Stats.UserUplink {
++		if len(user.Email) > 0 && p.Stats.UserUplink {
+ 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
+ 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+ 				inboundLink.Writer = &SizeStatWriter{
+@@ -170,7 +182,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+ 				}
+ 			}
+ 		}
+-		if p.Stats.UserDownlink {
++		if len(user.Email) > 0 && p.Stats.UserDownlink {
+ 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
+ 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+ 				outboundLink.Writer = &SizeStatWriter{
+@@ -181,14 +193,22 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+ 		}
+ 
+ 		if p.Stats.UserOnline {
+-			name := "user>>>" + user.Email + ">>>online"
+-			if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
+-				sessionInbounds := session.InboundFromContext(ctx)
+-				userIP := sessionInbounds.Source.Address.String()
+-				om.AddIP(userIP)
+-				// log Online user with ips
+-				// errors.LogDebug(ctx, "user>>>" + user.Email + ">>>online", om.Count(), om.List())
++			// Per-user online map (tracks IPs per user)
++			if len(user.Email) > 0 {
++				name := "user>>>" + user.Email + ">>>online"
++				if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
++					sessionInbounds := session.InboundFromContext(ctx)
++					userIP := sessionInbounds.Source.Address.String()
++					om.AddIP(userIP)
++				}
++			}
+ 
++			// Global inbound online map (tracks unique UUIDs across all connections)
++			if sessionInbound != nil && sessionInbound.Tag != "" && onlineIdentity != "" {
++				globalName := "inbound>>>" + sessionInbound.Tag + ">>>online"
++				if gom, _ := stats.GetOrRegisterOnlineMap(d.stats, globalName); gom != nil {
++					gom.AddIP(onlineIdentity)
++				}
+ 			}
+ 		}
+ 	}
+@@ -205,15 +225,16 @@ func (d *DefaultDispatcher) WrapLink(ctx context.Context, link *transport.Link)
+ 
+ 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+ 
+-	if user != nil && len(user.Email) > 0 {
++	if user != nil {
++		onlineIdentity := userOnlineIdentity(user)
+ 		p := d.policy.ForLevel(user.Level)
+-		if p.Stats.UserUplink {
++		if len(user.Email) > 0 && p.Stats.UserUplink {
+ 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
+ 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+ 				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
+ 			}
+ 		}
+-		if p.Stats.UserDownlink {
++		if len(user.Email) > 0 && p.Stats.UserDownlink {
+ 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
+ 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+ 				link.Writer = &SizeStatWriter{
+@@ -223,13 +244,22 @@ func (d *DefaultDispatcher) WrapLink(ctx context.Context, link *transport.Link)
+ 			}
+ 		}
+ 		if p.Stats.UserOnline {
+-			name := "user>>>" + user.Email + ">>>online"
+-			if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
+-				sessionInbounds := session.InboundFromContext(ctx)
+-				userIP := sessionInbounds.Source.Address.String()
+-				om.AddIP(userIP)
+-				// log Online user with ips
+-				// errors.LogDebug(ctx, "user>>>" + user.Email + ">>>online", om.Count(), om.List())
++			// Per-user online map (tracks IPs per user)
++			if len(user.Email) > 0 {
++				name := "user>>>" + user.Email + ">>>online"
++				if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
++					sessionInbounds := session.InboundFromContext(ctx)
++					userIP := sessionInbounds.Source.Address.String()
++					om.AddIP(userIP)
++				}
++			}
++
++			// Global inbound online map (tracks unique UUIDs across all connections)
++			if sessionInbound != nil && sessionInbound.Tag != "" && onlineIdentity != "" {
++				globalName := "inbound>>>" + sessionInbound.Tag + ">>>online"
++				if gom, _ := stats.GetOrRegisterOnlineMap(d.stats, globalName); gom != nil {
++					gom.AddIP(onlineIdentity)
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/app/metrics/metrics.go b/app/metrics/metrics.go
+index 1dc5b2f5..df7397b9 100644
+--- a/app/metrics/metrics.go
++++ b/app/metrics/metrics.go
+@@ -2,10 +2,12 @@ package metrics
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"expvar"
+ 	"net/http"
+ 	_ "net/http/pprof"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/xtls/xray-core/app/observatory"
+ 	"github.com/xtls/xray-core/app/stats"
+@@ -28,6 +30,87 @@ type MetricsHandler struct {
+ 	tcpListener  net.Listener
+ }
+ 
++type onlineUsersResponse struct {
++	AsOfMs int64            `json:"asOfMs"`
++	Direct map[string]int64 `json:"direct"`
++	Proxy  map[string]int64 `json:"proxy"`
++}
++
++type onlineUserPresence struct {
++	mode       string
++	lastSeenMs int64
++}
++
++func inboundTagFromOnlineMapName(name string) string {
++	parts := strings.Split(name, ">>>")
++	if len(parts) >= 2 {
++		return parts[1]
++	}
++	return ""
++}
++
++func classifyOnlineMode(tag string) string {
++	if strings.Contains(strings.ToLower(tag), "proxy") {
++		return "proxy"
++	}
++	return "direct"
++}
++
++func buildOnlineUsersResponse(manager *stats.Manager) onlineUsersResponse {
++	rawByMode := map[string]map[string]int64{
++		"direct": {},
++		"proxy":  {},
++	}
++
++	manager.VisitOnlineMaps(func(name string, om *stats.OnlineMap) bool {
++		if !strings.HasPrefix(name, "inbound>>>") {
++			return true
++		}
++
++		tag := inboundTagFromOnlineMapName(name)
++		if tag == "" {
++			return true
++		}
++
++		mode := classifyOnlineMode(tag)
++		for userID, lastSeen := range om.IpTimeMap() {
++			lastSeenMs := lastSeen.UnixMilli()
++			if current, found := rawByMode[mode][userID]; !found || lastSeenMs > current {
++				rawByMode[mode][userID] = lastSeenMs
++			}
++		}
++
++		return true
++	})
++
++	winners := make(map[string]onlineUserPresence)
++	for _, mode := range []string{"direct", "proxy"} {
++		for userID, lastSeenMs := range rawByMode[mode] {
++			if existing, found := winners[userID]; !found || lastSeenMs > existing.lastSeenMs {
++				winners[userID] = onlineUserPresence{
++					mode:       mode,
++					lastSeenMs: lastSeenMs,
++				}
++			}
++		}
++	}
++
++	resp := onlineUsersResponse{
++		AsOfMs: time.Now().UnixMilli(),
++		Direct: map[string]int64{},
++		Proxy:  map[string]int64{},
++	}
++	for userID, presence := range winners {
++		if presence.mode == "proxy" {
++			resp.Proxy[userID] = presence.lastSeenMs
++		} else {
++			resp.Direct[userID] = presence.lastSeenMs
++		}
++	}
++
++	return resp
++}
++
+ // NewMetricsHandler creates a new MetricsHandler based on the given config.
+ func NewMetricsHandler(ctx context.Context, config *Config) (*MetricsHandler, error) {
+ 	c := &MetricsHandler{
+@@ -62,6 +145,20 @@ func NewMetricsHandler(ctx context.Context, config *Config) (*MetricsHandler, er
+ 		})
+ 		return resp
+ 	}))
++	expvar.Publish("online", expvar.Func(func() interface{} {
++		manager, ok := c.statsManager.(*stats.Manager)
++		if !ok {
++			return nil
++		}
++		resp := map[string]int{}
++		manager.VisitOnlineMaps(func(name string, om *stats.OnlineMap) bool {
++			if strings.HasPrefix(name, "inbound>>>") {
++				resp[name] = om.Count()
++			}
++			return true
++		})
++		return resp
++	}))
+ 	expvar.Publish("observatory", expvar.Func(func() interface{} {
+ 		if c.observatory == nil {
+ 			common.Must(core.RequireFeatures(ctx, func(observatory extension.Observatory) error {
+@@ -82,6 +179,37 @@ func NewMetricsHandler(ctx context.Context, config *Config) (*MetricsHandler, er
+ 		}
+ 		return resp
+ 	}))
++	http.HandleFunc("/online", func(w http.ResponseWriter, r *http.Request) {
++		manager, ok := c.statsManager.(*stats.Manager)
++		if !ok {
++			w.WriteHeader(http.StatusInternalServerError)
++			return
++		}
++		resp := map[string]int{}
++		manager.VisitOnlineMaps(func(name string, om *stats.OnlineMap) bool {
++			if strings.HasPrefix(name, "inbound>>>") {
++				// Extract tag from "inbound>>>tag>>>online"
++				parts := strings.Split(name, ">>>")
++				if len(parts) >= 2 {
++					resp[parts[1]] = om.Count()
++				}
++			}
++			return true
++		})
++		w.Header().Set("Content-Type", "application/json")
++		json.NewEncoder(w).Encode(resp)
++	})
++	http.HandleFunc("/online-users", func(w http.ResponseWriter, r *http.Request) {
++		manager, ok := c.statsManager.(*stats.Manager)
++		if !ok {
++			w.WriteHeader(http.StatusInternalServerError)
++			return
++		}
++
++		w.Header().Set("Content-Type", "application/json")
++		json.NewEncoder(w).Encode(buildOnlineUsersResponse(manager))
++	})
++
+ 	return c, nil
+ }
+ 
+diff --git a/app/stats/online_map.go b/app/stats/online_map.go
+index a7933fdb..4421ce01 100644
+--- a/app/stats/online_map.go
++++ b/app/stats/online_map.go
+@@ -24,9 +24,12 @@ func NewOnlineMap() *OnlineMap {
+ 
+ // Count implements stats.OnlineMap.
+ func (c *OnlineMap) Count() int {
++	if time.Since(c.lastCleanup) > c.cleanupPeriod {
++		c.RemoveExpiredIPs()
++		c.lastCleanup = time.Now()
++	}
+ 	c.access.RLock()
+ 	defer c.access.RUnlock()
+-
+ 	return len(c.ipList)
+ }
+ 
+@@ -81,5 +84,13 @@ func (c *OnlineMap) IpTimeMap() map[string]time.Time {
+ 		c.lastCleanup = time.Now()
+ 	}
+ 
+-	return c.ipList
++	c.access.RLock()
++	defer c.access.RUnlock()
++
++	cloned := make(map[string]time.Time, len(c.ipList))
++	for k, v := range c.ipList {
++		cloned[k] = v
++	}
++
++	return cloned
+ }
+diff --git a/app/stats/stats.go b/app/stats/stats.go
+index 5451c5e6..f9ce1309 100644
+--- a/app/stats/stats.go
++++ b/app/stats/stats.go
+@@ -83,6 +83,18 @@ func (m *Manager) VisitCounters(visitor func(string, stats.Counter) bool) {
+ 	}
+ }
+ 
++// VisitOnlineMaps calls visitor function on all managed online maps.
++func (m *Manager) VisitOnlineMaps(visitor func(string, *OnlineMap) bool) {
++	m.access.RLock()
++	defer m.access.RUnlock()
++
++	for name, om := range m.onlineMap {
++		if !visitor(name, om) {
++			break
++		}
++	}
++}
++
+ // RegisterOnlineMap implements stats.Manager.
+ func (m *Manager) RegisterOnlineMap(name string) (stats.OnlineMap, error) {
+ 	m.access.Lock()
+diff --git a/common/session/session.go b/common/session/session.go
+index 7e0c0369..1891e28b 100644
+--- a/common/session/session.go
++++ b/common/session/session.go
+@@ -46,8 +46,14 @@ type Inbound struct {
+ 	Name string
+ 	// User is the user that authenticates for the inbound. May be nil if the protocol allows anonymous traffic.
+ 	User *protocol.MemoryUser
+-	// VlessRoute is the user-sent VLESS UUID's 7th<<8 | 8th bytes.
++	// VlessRoute is the user-sent VLESS UUID's 9th<<8 | 10th bytes (group 4).
+ 	VlessRoute net.Port
++	// RelayUUID holds the raw 16-byte UUID sent by the client.
++	// Set by VLESS inbound for relay outbound passthrough.
++	RelayUUID []byte
++	// RelayClientVersion holds the client's version string from VLESS addons.
++	// Set by VLESS inbound for relay outbound passthrough.
++	RelayClientVersion string
+ 	// Used by splice copy. Conn is actually internet.Connection. May be nil.
+ 	Conn net.Conn
+ 	// Used by splice copy. Timer of the inbound buf copier. May be nil.
+diff --git a/core/core.go b/core/core.go
+index 96624d1d..f600be07 100644
+--- a/core/core.go
++++ b/core/core.go
+@@ -19,7 +19,7 @@ import (
+ var (
+ 	Version_x byte = 25
+ 	Version_y byte = 12
+-	Version_z byte = 8
++	Version_z byte = 104
+ )
+ 
+ var (
+diff --git a/features/routing/context.go b/features/routing/context.go
+index 6b38d175..e564fa2a 100644
+--- a/features/routing/context.go
++++ b/features/routing/context.go
+@@ -41,7 +41,7 @@ type Context interface {
+ 	// GetUser returns the user email from the connection content, if exists.
+ 	GetUser() string
+ 
+-	// GetVlessRoute returns the user-sent VLESS UUID's 7th<<8 | 8th bytes, if exists.
++	// GetVlessRoute returns the user-sent VLESS UUID's 9th<<8 | 10th bytes (group 4), if exists.
+ 	GetVlessRoute() net.Port
+ 
+ 	// GetAttributes returns extra attributes from the conneciont content.
+diff --git a/infra/conf/vless.go b/infra/conf/vless.go
+index f482c4d8..39306a92 100644
+--- a/infra/conf/vless.go
++++ b/infra/conf/vless.go
+@@ -30,11 +30,13 @@ type VLessInboundFallback struct {
+ }
+ 
+ type VLessInboundConfig struct {
+-	Clients    []json.RawMessage       `json:"clients"`
+-	Decryption string                  `json:"decryption"`
+-	Fallbacks  []*VLessInboundFallback `json:"fallbacks"`
+-	Flow       string                  `json:"flow"`
+-	Testseed   []uint32                `json:"testseed"`
++	Clients           []json.RawMessage       `json:"clients"`
++	Decryption        string                  `json:"decryption"`
++	Fallbacks         []*VLessInboundFallback `json:"fallbacks"`
++	Flow              string                  `json:"flow"`
++	Validator         string                  `json:"validator"`
++	ValidatorEndpoint string                  `json:"validatorEndpoint"`
++	Testseed          []uint32                `json:"testseed"`
+ }
+ 
+ // Build implements Buildable
+@@ -91,6 +93,8 @@ func (c *VLessInboundConfig) Build() (proto.Message, error) {
+ 	}
+ 
+ 	config.Decryption = c.Decryption
++	config.Validator = c.Validator
++	config.ValidatorEndpoint = c.ValidatorEndpoint
+ 	if !func() bool {
+ 		s := strings.Split(config.Decryption, ".")
+ 		if len(s) < 4 || s[0] != "mlkem768x25519plus" {
+@@ -220,6 +224,7 @@ type VLessOutboundConfig struct {
+ 	Testpre    uint32                `json:"testpre"`
+ 	Testseed   []uint32              `json:"testseed"`
+ 	Vnext      []*VLessOutboundVnext `json:"vnext"`
++	Relay      bool                  `json:"relay"`
+ }
+ 
+ // Build implements Buildable
+@@ -340,6 +345,7 @@ func (c *VLessOutboundConfig) Build() (proto.Message, error) {
+ 		config.Vnext = spec
+ 		break
+ 	}
++	config.Relay = c.Relay
+ 
+ 	return config, nil
+ }
+diff --git a/proxy/vless/encoding/addons.go b/proxy/vless/encoding/addons.go
+index 724de777..db9d0e80 100644
+--- a/proxy/vless/encoding/addons.go
++++ b/proxy/vless/encoding/addons.go
+@@ -15,8 +15,8 @@ import (
+ )
+ 
+ func EncodeHeaderAddons(buffer *buf.Buffer, addons *Addons) error {
+-	switch addons.Flow {
+-	case vless.XRV:
++	needsProtobuf := addons.Flow == vless.XRV || addons.AuthVerified
++	if needsProtobuf {
+ 		bytes, err := proto.Marshal(addons)
+ 		if err != nil {
+ 			return errors.New("failed to marshal addons protobuf value").Base(err)
+@@ -27,7 +27,7 @@ func EncodeHeaderAddons(buffer *buf.Buffer, addons *Addons) error {
+ 		if _, err := buffer.Write(bytes); err != nil {
+ 			return errors.New("failed to write addons protobuf value").Base(err)
+ 		}
+-	default:
++	} else {
+ 		if err := buffer.WriteByte(0); err != nil {
+ 			return errors.New("failed to write addons protobuf length").Base(err)
+ 		}
+diff --git a/proxy/vless/encoding/addons.pb.go b/proxy/vless/encoding/addons.pb.go
+index 2f518841..2f3868cf 100644
+--- a/proxy/vless/encoding/addons.pb.go
++++ b/proxy/vless/encoding/addons.pb.go
+@@ -1,7 +1,7 @@
+ // Code generated by protoc-gen-go. DO NOT EDIT.
+ // versions:
+ // 	protoc-gen-go v1.35.1
+-// 	protoc        v5.28.2
++// 	protoc        v5.29.3
+ // source: proxy/vless/encoding/addons.proto
+ 
+ package encoding
+@@ -25,8 +25,10 @@ type Addons struct {
+ 	sizeCache     protoimpl.SizeCache
+ 	unknownFields protoimpl.UnknownFields
+ 
+-	Flow string `protobuf:"bytes,1,opt,name=Flow,proto3" json:"Flow,omitempty"`
+-	Seed []byte `protobuf:"bytes,2,opt,name=Seed,proto3" json:"Seed,omitempty"`
++	Flow          string `protobuf:"bytes,1,opt,name=Flow,proto3" json:"Flow,omitempty"`
++	Seed          []byte `protobuf:"bytes,2,opt,name=Seed,proto3" json:"Seed,omitempty"`
++	AuthVerified  bool   `protobuf:"varint,3,opt,name=AuthVerified,proto3" json:"AuthVerified,omitempty"`
++	ClientVersion string `protobuf:"bytes,4,opt,name=ClientVersion,proto3" json:"ClientVersion,omitempty"`
+ }
+ 
+ func (x *Addons) Reset() {
+@@ -73,24 +75,43 @@ func (x *Addons) GetSeed() []byte {
+ 	return nil
+ }
+ 
++func (x *Addons) GetAuthVerified() bool {
++	if x != nil {
++		return x.AuthVerified
++	}
++	return false
++}
++
++func (x *Addons) GetClientVersion() string {
++	if x != nil {
++		return x.ClientVersion
++	}
++	return ""
++}
++
+ var File_proxy_vless_encoding_addons_proto protoreflect.FileDescriptor
+ 
+ var file_proxy_vless_encoding_addons_proto_rawDesc = []byte{
+ 	0x0a, 0x21, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2f, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2f, 0x65, 0x6e,
+ 	0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x2f, 0x61, 0x64, 0x64, 0x6f, 0x6e, 0x73, 0x2e, 0x70, 0x72,
+ 	0x6f, 0x74, 0x6f, 0x12, 0x19, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2e,
+-	0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x22, 0x30,
++	0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x22, 0x7a,
+ 	0x0a, 0x06, 0x41, 0x64, 0x64, 0x6f, 0x6e, 0x73, 0x12, 0x12, 0x0a, 0x04, 0x46, 0x6c, 0x6f, 0x77,
+ 	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x46, 0x6c, 0x6f, 0x77, 0x12, 0x12, 0x0a, 0x04,
+ 	0x53, 0x65, 0x65, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x04, 0x53, 0x65, 0x65, 0x64,
+-	0x42, 0x6d, 0x0a, 0x1d, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x70, 0x72, 0x6f,
+-	0x78, 0x79, 0x2e, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e,
+-	0x67, 0x50, 0x01, 0x5a, 0x2e, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f,
+-	0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78, 0x72, 0x61, 0x79, 0x2d, 0x63, 0x6f, 0x72, 0x65, 0x2f, 0x70,
+-	0x72, 0x6f, 0x78, 0x79, 0x2f, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2f, 0x65, 0x6e, 0x63, 0x6f, 0x64,
+-	0x69, 0x6e, 0x67, 0xaa, 0x02, 0x19, 0x58, 0x72, 0x61, 0x79, 0x2e, 0x50, 0x72, 0x6f, 0x78, 0x79,
+-	0x2e, 0x56, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x45, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x62,
+-	0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x12, 0x22, 0x0a, 0x0c, 0x41, 0x75, 0x74, 0x68, 0x56, 0x65, 0x72, 0x69, 0x66, 0x69, 0x65, 0x64,
++	0x18, 0x03, 0x20, 0x01, 0x28, 0x08, 0x52, 0x0c, 0x41, 0x75, 0x74, 0x68, 0x56, 0x65, 0x72, 0x69,
++	0x66, 0x69, 0x65, 0x64, 0x12, 0x24, 0x0a, 0x0d, 0x43, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x56, 0x65,
++	0x72, 0x73, 0x69, 0x6f, 0x6e, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0d, 0x43, 0x6c, 0x69,
++	0x65, 0x6e, 0x74, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x42, 0x6d, 0x0a, 0x1d, 0x63, 0x6f,
++	0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2e, 0x76, 0x6c, 0x65,
++	0x73, 0x73, 0x2e, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x50, 0x01, 0x5a, 0x2e, 0x67,
++	0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78,
++	0x72, 0x61, 0x79, 0x2d, 0x63, 0x6f, 0x72, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2f, 0x76,
++	0x6c, 0x65, 0x73, 0x73, 0x2f, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0xaa, 0x02, 0x19,
++	0x58, 0x72, 0x61, 0x79, 0x2e, 0x50, 0x72, 0x6f, 0x78, 0x79, 0x2e, 0x56, 0x6c, 0x65, 0x73, 0x73,
++	0x2e, 0x45, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f,
++	0x33,
+ }
+ 
+ var (
+diff --git a/proxy/vless/encoding/addons.proto b/proxy/vless/encoding/addons.proto
+index 3730e87f..678f8c01 100644
+--- a/proxy/vless/encoding/addons.proto
++++ b/proxy/vless/encoding/addons.proto
+@@ -9,4 +9,6 @@ option java_multiple_files = true;
+ message Addons {
+   string Flow = 1;
+   bytes Seed = 2;
++  bool AuthVerified = 3;
++  string ClientVersion = 4;
+ }
+diff --git a/proxy/vless/encoding/encoding.go b/proxy/vless/encoding/encoding.go
+index fe2c6bc8..e8d898ef 100644
+--- a/proxy/vless/encoding/encoding.go
++++ b/proxy/vless/encoding/encoding.go
+@@ -90,19 +90,22 @@ func DecodeRequestHeader(isfb bool, first *buf.Buffer, reader io.Reader, validat
+ 			copy(id[:], buffer.Bytes())
+ 		}
+ 
+-		if request.User = validator.Get(id); request.User == nil {
+-			return nil, nil, nil, isfb, errors.New("invalid request user id")
+-		}
+-
+ 		if isfb {
+ 			first.Advance(17)
+ 		}
+ 
++		// Decode addons BEFORE validator.Get() so ClientVersion is available
++		// for the very first tower validation call.
+ 		requestAddons, err := DecodeHeaderAddons(&buffer, reader)
+ 		if err != nil {
+ 			return nil, nil, nil, false, errors.New("failed to decode request header addons").Base(err)
+ 		}
+ 
++		// Validate UUID with tower — clientVersion from addons is now available.
++		if request.User = validator.GetWithMeta(id, requestAddons.GetClientVersion()); request.User == nil {
++			return id[:], nil, nil, false, errors.New("invalid request user id")
++		}
++
+ 		buffer.Clear()
+ 		if _, err := buffer.ReadFullFrom(reader, 1); err != nil {
+ 			return nil, nil, nil, false, errors.New("failed to read request command").Base(err)
+@@ -158,8 +161,24 @@ func DecodeResponseHeader(reader io.Reader, request *protocol.RequestHeader) (*A
+ 		return nil, errors.New("failed to read response version").Base(err)
+ 	}
+ 
+-	if buffer.Byte(0) != request.Version {
+-		return nil, errors.New("unexpected response version. Expecting ", int(request.Version), " but actually ", int(buffer.Byte(0)))
++	firstByte := buffer.Byte(0)
++
++	// Check for server error response (XERR magic)
++	if firstByte == 'X' {
++		serverErr, parseErr := TryParseServerError(reader, firstByte)
++		if parseErr != nil {
++			return nil, errors.New("failed to parse server error response").Base(parseErr)
++		}
++		if serverErr != nil {
++			// Return the ServerError as the error - it implements the error interface
++			return nil, serverErr
++		}
++		// If TryParseServerError returns nil, nil - it wasn't actually XERR
++		// Fall through to normal version check (will fail since 'X' != 0x00)
++	}
++
++	if firstByte != request.Version {
++		return nil, errors.New("unexpected response version. Expecting ", int(request.Version), " but actually ", int(firstByte))
+ 	}
+ 
+ 	responseAddons, err := DecodeHeaderAddons(&buffer, reader)
+diff --git a/proxy/vless/encoding/error_response.go b/proxy/vless/encoding/error_response.go
+new file mode 100644
+index 00000000..d070b10b
+--- /dev/null
++++ b/proxy/vless/encoding/error_response.go
+@@ -0,0 +1,88 @@
++package encoding
++
++import (
++	"encoding/binary"
++	"fmt"
++	"io"
++)
++
++// Error response protocol for VLESS (client-side parsing)
++// Format: [Magic:4][Version:1][Severity:1][Code:1][MsgLen:2][Message:UTF-8]
++
++const (
++	// ErrorMagic is the magic bytes that identify an error response
++	ErrorMagic = "XERR"
++
++	// Severity levels
++	SeverityCritical = 0x01 // Client should disconnect immediately
++	SeverityWarning  = 0x02 // Client may retry or show warning
++	SeverityInfo     = 0x03 // Informational only
++)
++
++// ServerError represents an error response from the VLESS server.
++// It implements the error interface so it can be returned as an error.
++type ServerError struct {
++	Severity byte
++	Code     byte
++	Message  string
++}
++
++// Error implements the error interface.
++// The format "server error [code]: message" is used for log parsing on the client side.
++func (e *ServerError) Error() string {
++	return fmt.Sprintf("server error [%d]: %s", e.Code, e.Message)
++}
++
++// IsCritical returns true if this is a critical error that should cause disconnect.
++func (e *ServerError) IsCritical() bool {
++	return e.Severity == SeverityCritical
++}
++
++// TryParseServerError attempts to parse a server error response.
++// It takes the first byte already read (to check for 'X') and the reader for remaining data.
++// Returns nil, nil if the data does not start with XERR magic (not an error response).
++// Returns the ServerError if successfully parsed.
++// Returns nil, error if parsing fails after detecting XERR magic.
++func TryParseServerError(reader io.Reader, firstByte byte) (*ServerError, error) {
++	// Check if first byte is 'X' (0x58)
++	if firstByte != 'X' {
++		return nil, nil // Not an error response
++	}
++
++	// Read remaining 3 bytes of magic ("ERR")
++	magicRest := make([]byte, 3)
++	if _, err := io.ReadFull(reader, magicRest); err != nil {
++		return nil, nil // Not enough data, probably not XERR
++	}
++
++	// Check if magic matches "XERR"
++	if string(append([]byte{firstByte}, magicRest...)) != ErrorMagic {
++		return nil, nil // Not an error response
++	}
++
++	// Parse the rest of the error response:
++	// [Version:1][Severity:1][Code:1][MsgLen:2][Message:variable]
++	header := make([]byte, 5)
++	if _, err := io.ReadFull(reader, header); err != nil {
++		return nil, fmt.Errorf("failed to read error response header: %w", err)
++	}
++
++	// version := header[0] // Currently unused, for future compatibility
++	severity := header[1]
++	code := header[2]
++	msgLen := binary.BigEndian.Uint16(header[3:5])
++
++	// Read the message
++	msg := make([]byte, msgLen)
++	if msgLen > 0 {
++		if _, err := io.ReadFull(reader, msg); err != nil {
++			return nil, fmt.Errorf("failed to read error message: %w", err)
++		}
++	}
++
++	return &ServerError{
++		Severity: severity,
++		Code:     code,
++		Message:  string(msg),
++	}, nil
++}
+diff --git a/proxy/vless/inbound/config.pb.go b/proxy/vless/inbound/config.pb.go
+index f65da3c4..0b5f50db 100644
+--- a/proxy/vless/inbound/config.pb.go
++++ b/proxy/vless/inbound/config.pb.go
+@@ -1,7 +1,7 @@
+ // Code generated by protoc-gen-go. DO NOT EDIT.
+ // versions:
+ // 	protoc-gen-go v1.35.1
+-// 	protoc        v5.28.2
++// 	protoc        v5.29.3
+ // source: proxy/vless/inbound/config.proto
+ 
+ package inbound
+@@ -111,13 +111,15 @@ type Config struct {
+ 	sizeCache     protoimpl.SizeCache
+ 	unknownFields protoimpl.UnknownFields
+ 
+-	Clients     []*protocol.User `protobuf:"bytes,1,rep,name=clients,proto3" json:"clients,omitempty"`
+-	Fallbacks   []*Fallback      `protobuf:"bytes,2,rep,name=fallbacks,proto3" json:"fallbacks,omitempty"`
+-	Decryption  string           `protobuf:"bytes,3,opt,name=decryption,proto3" json:"decryption,omitempty"`
+-	XorMode     uint32           `protobuf:"varint,4,opt,name=xorMode,proto3" json:"xorMode,omitempty"`
+-	SecondsFrom int64            `protobuf:"varint,5,opt,name=seconds_from,json=secondsFrom,proto3" json:"seconds_from,omitempty"`
+-	SecondsTo   int64            `protobuf:"varint,6,opt,name=seconds_to,json=secondsTo,proto3" json:"seconds_to,omitempty"`
+-	Padding     string           `protobuf:"bytes,7,opt,name=padding,proto3" json:"padding,omitempty"`
++	Clients           []*protocol.User `protobuf:"bytes,1,rep,name=clients,proto3" json:"clients,omitempty"`
++	Fallbacks         []*Fallback      `protobuf:"bytes,2,rep,name=fallbacks,proto3" json:"fallbacks,omitempty"`
++	Decryption        string           `protobuf:"bytes,3,opt,name=decryption,proto3" json:"decryption,omitempty"`
++	XorMode           uint32           `protobuf:"varint,4,opt,name=xorMode,proto3" json:"xorMode,omitempty"`
++	SecondsFrom       int64            `protobuf:"varint,5,opt,name=seconds_from,json=secondsFrom,proto3" json:"seconds_from,omitempty"`
++	SecondsTo         int64            `protobuf:"varint,6,opt,name=seconds_to,json=secondsTo,proto3" json:"seconds_to,omitempty"`
++	Padding           string           `protobuf:"bytes,7,opt,name=padding,proto3" json:"padding,omitempty"`
++	Validator         string           `protobuf:"bytes,8,opt,name=validator,proto3" json:"validator,omitempty"`
++	ValidatorEndpoint string           `protobuf:"bytes,9,opt,name=validator_endpoint,json=validatorEndpoint,proto3" json:"validator_endpoint,omitempty"`
+ }
+ 
+ func (x *Config) Reset() {
+@@ -199,6 +201,20 @@ func (x *Config) GetPadding() string {
+ 	return ""
+ }
+ 
++func (x *Config) GetValidator() string {
++	if x != nil {
++		return x.Validator
++	}
++	return ""
++}
++
++func (x *Config) GetValidatorEndpoint() string {
++	if x != nil {
++		return x.ValidatorEndpoint
++	}
++	return ""
++}
++
+ var File_proxy_vless_inbound_config_proto protoreflect.FileDescriptor
+ 
+ var file_proxy_vless_inbound_config_proto_rawDesc = []byte{
+@@ -215,7 +231,7 @@ var file_proxy_vless_inbound_config_proto_rawDesc = []byte{
+ 	0x68, 0x12, 0x12, 0x0a, 0x04, 0x74, 0x79, 0x70, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x52,
+ 	0x04, 0x74, 0x79, 0x70, 0x65, 0x12, 0x12, 0x0a, 0x04, 0x64, 0x65, 0x73, 0x74, 0x18, 0x05, 0x20,
+ 	0x01, 0x28, 0x09, 0x52, 0x04, 0x64, 0x65, 0x73, 0x74, 0x12, 0x12, 0x0a, 0x04, 0x78, 0x76, 0x65,
+-	0x72, 0x18, 0x06, 0x20, 0x01, 0x28, 0x04, 0x52, 0x04, 0x78, 0x76, 0x65, 0x72, 0x22, 0x96, 0x02,
++	0x72, 0x18, 0x06, 0x20, 0x01, 0x28, 0x04, 0x52, 0x04, 0x78, 0x76, 0x65, 0x72, 0x22, 0xe3, 0x02,
+ 	0x0a, 0x06, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x12, 0x34, 0x0a, 0x07, 0x63, 0x6c, 0x69, 0x65,
+ 	0x6e, 0x74, 0x73, 0x18, 0x01, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x1a, 0x2e, 0x78, 0x72, 0x61, 0x79,
+ 	0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x63, 0x6f, 0x6c,
+@@ -233,14 +249,19 @@ var file_proxy_vless_inbound_config_proto_rawDesc = []byte{
+ 	0x0a, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x73, 0x5f, 0x74, 0x6f, 0x18, 0x06, 0x20, 0x01, 0x28,
+ 	0x03, 0x52, 0x09, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x73, 0x54, 0x6f, 0x12, 0x18, 0x0a, 0x07,
+ 	0x70, 0x61, 0x64, 0x64, 0x69, 0x6e, 0x67, 0x18, 0x07, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x70,
+-	0x61, 0x64, 0x64, 0x69, 0x6e, 0x67, 0x42, 0x6a, 0x0a, 0x1c, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72,
+-	0x61, 0x79, 0x2e, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2e, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x69,
+-	0x6e, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x50, 0x01, 0x5a, 0x2d, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62,
+-	0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78, 0x72, 0x61, 0x79, 0x2d, 0x63,
+-	0x6f, 0x72, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2f, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2f,
+-	0x69, 0x6e, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0xaa, 0x02, 0x18, 0x58, 0x72, 0x61, 0x79, 0x2e, 0x50,
+-	0x72, 0x6f, 0x78, 0x79, 0x2e, 0x56, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x49, 0x6e, 0x62, 0x6f, 0x75,
+-	0x6e, 0x64, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x61, 0x64, 0x64, 0x69, 0x6e, 0x67, 0x12, 0x1c, 0x0a, 0x09, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x61,
++	0x74, 0x6f, 0x72, 0x18, 0x08, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x76, 0x61, 0x6c, 0x69, 0x64,
++	0x61, 0x74, 0x6f, 0x72, 0x12, 0x2d, 0x0a, 0x12, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x61, 0x74, 0x6f,
++	0x72, 0x5f, 0x65, 0x6e, 0x64, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x18, 0x09, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x11, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x61, 0x74, 0x6f, 0x72, 0x45, 0x6e, 0x64, 0x70, 0x6f,
++	0x69, 0x6e, 0x74, 0x42, 0x6a, 0x0a, 0x1c, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e,
++	0x70, 0x72, 0x6f, 0x78, 0x79, 0x2e, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x69, 0x6e, 0x62, 0x6f,
++	0x75, 0x6e, 0x64, 0x50, 0x01, 0x5a, 0x2d, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f,
++	0x6d, 0x2f, 0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78, 0x72, 0x61, 0x79, 0x2d, 0x63, 0x6f, 0x72, 0x65,
++	0x2f, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2f, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2f, 0x69, 0x6e, 0x62,
++	0x6f, 0x75, 0x6e, 0x64, 0xaa, 0x02, 0x18, 0x58, 0x72, 0x61, 0x79, 0x2e, 0x50, 0x72, 0x6f, 0x78,
++	0x79, 0x2e, 0x56, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x49, 0x6e, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x62,
++	0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+ }
+ 
+ var (
+diff --git a/proxy/vless/inbound/config.proto b/proxy/vless/inbound/config.proto
+index 5a7e3e19..8dd0b3c9 100644
+--- a/proxy/vless/inbound/config.proto
++++ b/proxy/vless/inbound/config.proto
+@@ -26,4 +26,6 @@ message Config {
+   int64 seconds_from = 5;
+   int64 seconds_to = 6;
+   string padding = 7;
++  string validator = 8;
++  string validator_endpoint = 9;
+ }
+diff --git a/proxy/vless/inbound/error_response.go b/proxy/vless/inbound/error_response.go
+new file mode 100644
+index 00000000..ea9f5df1
+--- /dev/null
++++ b/proxy/vless/inbound/error_response.go
+@@ -0,0 +1,81 @@
++package inbound
++
++import (
++	"encoding/binary"
++	"net"
++)
++
++// Error response protocol for VLESS
++// Format: [Magic:4][Version:1][Severity:1][Code:1][MsgLen:2][Message:UTF-8]
++
++const (
++	// ErrorMagic is the magic bytes that identify an error response
++	ErrorMagic = "XERR"
++
++	// ErrorVersion is the current version of the error response protocol
++	ErrorVersion = 0x01
++
++	// Severity levels
++	SeverityCritical = 0x01 // Client should disconnect immediately
++	SeverityWarning  = 0x02 // Client may retry or show warning
++	SeverityInfo     = 0x03 // Informational only
++
++	// Error codes (must match tower API)
++	ErrInvalidUUID      = 0x01 // Invalid or unknown UUID
++	ErrExpiredUUID      = 0x02 // UUID has expired
++	ErrRevokedUUID      = 0x03 // UUID has been revoked/banned
++	ErrRateLimited      = 0x04 // Too many requests
++	ErrServerBusy       = 0x05 // Server is busy
++	ErrSubscriptionExp  = 0x10 // Subscription expired
++	ErrAccountSuspended = 0x11 // Account suspended
++	ErrServerMessage    = 0xFE // Server info message
++	ErrCustom           = 0xFF // Custom error (see message)
++)
++
++// GetSeverityForCode returns the appropriate severity level for an error code
++func GetSeverityForCode(code int) byte {
++	switch code {
++	case ErrInvalidUUID, ErrExpiredUUID, ErrRevokedUUID, ErrSubscriptionExp, ErrAccountSuspended:
++		return SeverityCritical
++	case ErrRateLimited, ErrServerBusy:
++		return SeverityWarning
++	case ErrServerMessage:
++		return SeverityInfo
++	default:
++		return SeverityCritical // Default to critical for unknown codes
++	}
++}
++
++// SendErrorResponse sends an XERR error response to the client before closing the connection.
++// This allows the client to understand why the connection was rejected.
++func SendErrorResponse(conn net.Conn, severity byte, code byte, msg string) error {
++	// Limit message length to prevent overflow (max 65535 bytes due to uint16)
++	if len(msg) > 65535 {
++		msg = msg[:65535]
++	}
++
++	// Build the error response
++	// [Magic:4][Version:1][Severity:1][Code:1][MsgLen:2][Message:variable]
++	buf := make([]byte, 4+1+1+1+2+len(msg))
++
++	// Magic bytes "XERR"
++	copy(buf[0:4], ErrorMagic)
++
++	// Version
++	buf[4] = ErrorVersion
++
++	// Severity
++	buf[5] = severity
++
++	// Error code
++	buf[6] = code
++
++	// Message length (big-endian)
++	binary.BigEndian.PutUint16(buf[7:9], uint16(len(msg)))
++
++	// Message content
++	copy(buf[9:], msg)
++
++	_, err := conn.Write(buf)
++	return err
++}
+diff --git a/proxy/vless/inbound/inbound.go b/proxy/vless/inbound/inbound.go
+index 89ed0e72..ef8e1d1e 100644
+--- a/proxy/vless/inbound/inbound.go
++++ b/proxy/vless/inbound/inbound.go
+@@ -25,6 +25,7 @@ import (
+ 	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/common/signal"
+ 	"github.com/xtls/xray-core/common/task"
++	"github.com/xtls/xray-core/common/uuid"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/dns"
+ 	feature_inbound "github.com/xtls/xray-core/features/inbound"
+@@ -64,7 +65,24 @@ func init() {
+ 			}
+ 		}
+ 
+-		return New(ctx, c, dc, validator)
++		var selectedValidator vless.Validator = validator
++		switch strings.ToLower(c.Validator) {
++		case "", "default":
++			errors.LogInfo(ctx, "vless inbound using default memory validator")
++		case "remote":
++			if c.ValidatorEndpoint == "" {
++				return nil, errors.New("validatorEndpoint is required when validator is remote").AtError()
++			}
++			selectedValidator = newRemoteValidator(validator, c.ValidatorEndpoint)
++			errors.LogInfo(ctx, "vless inbound using remote validator at ", c.ValidatorEndpoint)
++		case "relay":
++			selectedValidator = &relayValidator{}
++			errors.LogInfo(ctx, "vless inbound using relay passthrough validator (no auth)")
++		default:
++			return nil, errors.New("unknown validator option: ", c.Validator).AtError()
++		}
++
++		return New(ctx, c, dc, selectedValidator)
+ 	}))
+ }
+ 
+@@ -306,9 +324,34 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
+ 	if isfb && firstLen < 18 {
+ 		err = errors.New("fallback directly")
+ 	} else {
++		errors.LogInfo(ctx, "decoding VLESS request header with validator ", reflect.TypeOf(h.validator))
+ 		userSentID, request, requestAddons, isfb, err = encoding.DecodeRequestHeader(isfb, first, reader, h.validator)
+ 	}
+ 
++	// Send XERR error response if validation failed
++	if err != nil && strings.Contains(err.Error(), "invalid request user id") {
++		if remoteVal, ok := h.validator.(*remoteValidator); ok {
++			// Use userSentID which was already extracted by DecodeRequestHeader
++			// (we can't re-extract from first buffer as its position has advanced)
++			if len(userSentID) == 16 {
++				var id uuid.UUID
++				copy(id[:], userSentID)
++				code, msg := remoteVal.GetLastError(id)
++				// Use default error if tower didn't provide specific details
++				if code == 0 {
++					code = ErrInvalidUUID
++					msg = "Invalid or unknown user ID"
++				}
++				severity := GetSeverityForCode(code)
++				if sendErr := SendErrorResponse(connection, severity, byte(code), msg); sendErr != nil {
++					errors.LogWarningInner(ctx, sendErr, "failed to send XERR error response")
++				} else {
++					errors.LogInfo(ctx, "sent XERR error response: code=", code, " msg=", msg)
++				}
++			}
++		}
++	}
++
+ 	if err != nil {
+ 		if isfb {
+ 			if err := connection.SetReadDeadline(time.Time{}); err != nil {
+@@ -534,7 +577,16 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
+ 	}
+ 	inbound.Name = "vless"
+ 	inbound.User = request.User
+-	inbound.VlessRoute = net.PortFromBytes(userSentID[6:8])
++	inbound.VlessRoute = net.PortFromBytes(userSentID[8:10])
++	if _, isRelay := h.validator.(*relayValidator); isRelay {
++		if len(userSentID) == 16 {
++			inbound.RelayUUID = make([]byte, 16)
++			copy(inbound.RelayUUID, userSentID)
++		}
++		if requestAddons != nil {
++			inbound.RelayClientVersion = requestAddons.GetClientVersion()
++		}
++	}
+ 
+ 	account := request.User.Account.(*vless.MemoryAccount)
+ 
+@@ -544,13 +596,14 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
+ 
+ 	responseAddons := &encoding.Addons{
+ 		// Flow: requestAddons.Flow,
++		AuthVerified: true,
+ 	}
+ 
+ 	var input *bytes.Reader
+ 	var rawInput *bytes.Buffer
+ 	switch requestAddons.Flow {
+ 	case vless.XRV:
+-		if account.Flow == requestAddons.Flow {
++		if account.Flow == "" || account.Flow == requestAddons.Flow {
+ 			inbound.CanSpliceCopy = 2
+ 			switch request.Command {
+ 			case protocol.RequestCommandUDP:
+@@ -593,7 +646,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
+ 			return errors.New("account " + account.ID.String() + " is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.").AtWarning()
+ 		}
+ 	default:
+-		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
++		if account.Flow == "" {
++			inbound.CanSpliceCopy = 3
++		} else {
++			return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
++		}
+ 	}
+ 
+ 	if request.Command != protocol.RequestCommandMux {
+diff --git a/proxy/vless/inbound/validator_relay.go b/proxy/vless/inbound/validator_relay.go
+new file mode 100644
+index 00000000..930f0eb8
+--- /dev/null
++++ b/proxy/vless/inbound/validator_relay.go
+@@ -0,0 +1,35 @@
++package inbound
++
++import (
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/uuid"
++	"github.com/xtls/xray-core/proxy/vless"
++)
++
++// Ensure relayValidator implements the Validator interface.
++var _ vless.Validator = (*relayValidator)(nil)
++
++// relayValidator accepts any UUID without authentication.
++// Used on relay servers where auth is deferred to the exit node.
++type relayValidator struct{}
++
++func (v *relayValidator) Get(id uuid.UUID) *protocol.MemoryUser {
++	return v.syntheticUser(id)
++}
++
++func (v *relayValidator) GetWithMeta(id uuid.UUID, clientVersion string) *protocol.MemoryUser {
++	return v.syntheticUser(id)
++}
++
++func (v *relayValidator) Add(u *protocol.MemoryUser) error             { return nil }
++func (v *relayValidator) Del(email string) error                       { return nil }
++func (v *relayValidator) GetByEmail(email string) *protocol.MemoryUser { return nil }
++func (v *relayValidator) GetAll() []*protocol.MemoryUser               { return nil }
++func (v *relayValidator) GetCount() int64                              { return 0 }
++
++func (v *relayValidator) syntheticUser(id uuid.UUID) *protocol.MemoryUser {
++	return &protocol.MemoryUser{
++		Account: &vless.MemoryAccount{ID: protocol.NewID(id)},
++		Level:   0,
++	}
++}
+diff --git a/proxy/vless/inbound/validator_remote.go b/proxy/vless/inbound/validator_remote.go
+new file mode 100644
+index 00000000..3dbed00f
+--- /dev/null
++++ b/proxy/vless/inbound/validator_remote.go
+@@ -0,0 +1,337 @@
++package inbound
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"net/http"
++	"sync"
++	"time"
++
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/uuid"
++	"github.com/xtls/xray-core/proxy/vless"
++)
++
++// remoteValidator wraps the in-memory validator and adds remote UUID verification with caching.
++type remoteValidator struct {
++	local    *vless.MemoryValidator
++	endpoint string
++	client   *http.Client
++
++	cache sync.Map // map[string]cachedStatus keyed by normalized UUID string
++
++	// in-flight dedup per key
++	inflightMu sync.Mutex
++	inflight   map[string]*inflightCall
++}
++
++type inflightCall struct {
++	wg      sync.WaitGroup
++	allowed bool
++	// cache timing outputs
++	decisionTTL time.Duration
++	heartbeat   time.Duration
++	denyTTL     time.Duration
++	err         error
++	// error details from tower (when denied)
++	errorCode int
++	errorMsg  string
++}
++
++type cachedStatus struct {
++	allowed bool
++	reason  string
++
++	// If allowed:
++	decisionUntil time.Time // long validity window (e.g. up to 6h, bounded by exp)
++	nextTouchAt   time.Time // when to touch tower again to keep 1h device lock alive
++
++	// If denied:
++	denyUntil time.Time // short negative cache (e.g. 30s)
++	errorCode int       // error code from tower (for client error response)
++	errorMsg  string    // error message from tower (for client error response)
++}
++
++func newRemoteValidator(local *vless.MemoryValidator, endpoint string) vless.Validator {
++	rv := &remoteValidator{
++		local:    local,
++		endpoint: endpoint,
++		client:   &http.Client{Timeout: 5 * time.Second},
++		inflight: make(map[string]*inflightCall),
++	}
++
++	// Prevent unbounded growth: periodically remove irrelevant/expired cache entries.
++	rv.startJanitor(5 * time.Minute)
++
++	return rv
++}
++
++func (r *remoteValidator) Add(u *protocol.MemoryUser) error { return r.local.Add(u) }
++func (r *remoteValidator) Del(email string) error           { return r.local.Del(email) }
++
++func (r *remoteValidator) Get(id uuid.UUID) *protocol.MemoryUser {
++	return r.GetWithMeta(id, "")
++}
++
++func (r *remoteValidator) GetWithMeta(id uuid.UUID, clientVersion string) *protocol.MemoryUser {
++	// IMPORTANT: keep UUID intact (exactly what client uses/sends in VLESS).
++	key := id.String()
++
++	now := time.Now()
++
++	// Fast path: cache hit
++	if v, ok := r.cache.Load(key); ok {
++		e, ok := v.(cachedStatus)
++		if !ok {
++			// defensive: corrupted value -> drop
++			r.cache.Delete(key)
++		} else {
++			// Deny cached
++			if !e.allowed && now.Before(e.denyUntil) {
++				return nil
++			}
++
++			// Allow cached and no touch due
++			if e.allowed && now.Before(e.decisionUntil) && now.Before(e.nextTouchAt) {
++				if user := r.local.Get(id); user != nil {
++					return user
++				}
++				return r.syntheticUser(id)
++			}
++			// else: expired decision OR touch due -> re-check (dedup)
++		}
++	}
++
++	allowed, decisionTTL, heartbeat, denyTTL, errorCode, errorMsg := r.checkRemoteDedup(key, clientVersion)
++
++	// Update cache
++	if !allowed {
++		r.cache.Store(key, cachedStatus{
++			allowed:   false,
++			reason:    "denied",
++			denyUntil: now.Add(denyTTL),
++			errorCode: errorCode,
++			errorMsg:  errorMsg,
++		})
++		return nil
++	}
++
++	// Allowed:
++	// decisionUntil = now + decisionTTL
++	// nextTouchAt = now + heartbeat
++	r.cache.Store(key, cachedStatus{
++		allowed:       true,
++		reason:        "ok",
++		decisionUntil: now.Add(decisionTTL),
++		nextTouchAt:   now.Add(heartbeat),
++		denyUntil:     time.Time{},
++	})
++
++	if user := r.local.Get(id); user != nil {
++		return user
++	}
++	return r.syntheticUser(id)
++}
++
++func (r *remoteValidator) GetByEmail(email string) *protocol.MemoryUser {
++	return r.local.GetByEmail(email)
++}
++func (r *remoteValidator) GetAll() []*protocol.MemoryUser { return r.local.GetAll() }
++func (r *remoteValidator) GetCount() int64                { return r.local.GetCount() }
++
++// GetLastError returns the error code and message for a denied UUID from cache.
++// Returns (0, "") if the UUID is not in cache or was not denied.
++func (r *remoteValidator) GetLastError(id uuid.UUID) (code int, msg string) {
++	key := id.String()
++	if v, ok := r.cache.Load(key); ok {
++		if e, ok := v.(cachedStatus); ok && !e.allowed {
++			return e.errorCode, e.errorMsg
++		}
++	}
++	return 0, ""
++}
++
++func (r *remoteValidator) syntheticUser(id uuid.UUID) *protocol.MemoryUser {
++	return &protocol.MemoryUser{
++		Email: id.String() + "@remote",
++		Account: &vless.MemoryAccount{
++			ID: protocol.NewID(id),
++		},
++	}
++}
++
++// Deduplicate tower calls per uuid key.
++func (r *remoteValidator) checkRemoteDedup(uuidStr string, clientVersion string) (allowed bool, decisionTTL, heartbeat, denyTTL time.Duration, errorCode int, errorMsg string) {
++	// defaults (safe and low load)
++	defaultDecision := 6 * time.Hour
++	defaultHeartbeat := 30 * time.Minute
++	defaultDeny := 30 * time.Second
++
++	r.inflightMu.Lock()
++	if c, ok := r.inflight[uuidStr]; ok {
++		r.inflightMu.Unlock()
++		c.wg.Wait()
++		if c.err != nil {
++			// On tower error: conservative deny (you can choose allow-if-previously-allowed via cache logic)
++			return false, 0, 0, 10 * time.Second, 0, ""
++		}
++		return c.allowed, c.decisionTTL, c.heartbeat, c.denyTTL, c.errorCode, c.errorMsg
++	}
++
++	c := &inflightCall{}
++	c.wg.Add(1)
++	r.inflight[uuidStr] = c
++	r.inflightMu.Unlock()
++
++	defer func() {
++		r.inflightMu.Lock()
++		delete(r.inflight, uuidStr)
++		r.inflightMu.Unlock()
++		c.wg.Done()
++	}()
++
++	a, dTTL, hb, dny, errCode, errMsg, err := r.checkRemote(uuidStr, clientVersion, defaultDecision, defaultHeartbeat, defaultDeny)
++	c.allowed = a
++	c.decisionTTL = dTTL
++	c.heartbeat = hb
++	c.denyTTL = dny
++	c.errorCode = errCode
++	c.errorMsg = errMsg
++	c.err = err
++
++	if err != nil {
++		return false, 0, 0, 10 * time.Second, 0, ""
++	}
++	return a, dTTL, hb, dny, errCode, errMsg
++}
++
++func (r *remoteValidator) checkRemote(uuidStr string, clientVersion string, defDecision, defHeartbeat, defDeny time.Duration) (allowed bool, decisionTTL, heartbeat, denyTTL time.Duration, errorCode int, errorMsg string, err error) {
++	payload := map[string]string{"uuid": uuidStr}
++	if clientVersion != "" {
++		payload["clientVersion"] = clientVersion
++	}
++	body, err := json.Marshal(payload)
++	if err != nil {
++		errors.LogInfo(context.Background(), "remote validator marshal error: ", err)
++		return false, 0, 0, 0, 0, "", err
++	}
++
++	req, err := http.NewRequest(http.MethodPost, r.endpoint, bytes.NewReader(body))
++	if err != nil {
++		errors.LogInfo(context.Background(), "remote validator request build error: ", err)
++		return false, 0, 0, 0, 0, "", err
++	}
++	req.Header.Set("Content-Type", "application/json")
++
++	// Auth intentionally removed: do NOT send x-tower-key.
++
++	resp, err := r.client.Do(req)
++	if err != nil {
++		errors.LogInfo(context.Background(), "remote validator http error: ", err)
++		return false, 0, 0, 0, 0, "", err
++	}
++	defer resp.Body.Close()
++
++	// Tower returns 200 even for deny (status=1). Treat non-2xx as error.
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		errors.LogInfo(context.Background(), "remote validator bad status: ", resp.StatusCode)
++		return false, 0, 0, 0, 0, "", errors.New("tower bad status")
++	}
++
++	var result struct {
++		Status         int    `json:"status"`       // 0 = allow
++		ErrorCode      int    `json:"errorCode"`    // error code for client (when denied)
++		ErrorMessage   string `json:"errorMessage"` // error message for client (when denied)
++		DecisionTTLSec int    `json:"decisionTtlSec"`
++		HeartbeatSec   int    `json:"heartbeatSec"`
++		TTLSec         int    `json:"ttlSec"` // deny cache ttl
++	}
++	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
++		errors.LogInfo(context.Background(), "remote validator decode error: ", err)
++		return false, 0, 0, 0, 0, "", err
++	}
++
++	// Use tower TTLs as-is; only apply safety clamps to avoid spamming tower too quickly.
++	const (
++		minHeartbeat = 5 * time.Second
++		minDeny      = 5 * time.Second
++		maxDecision  = 24 * time.Hour
++		maxDeny      = 5 * time.Minute
++	)
++
++	// decisionTTL
++	if result.DecisionTTLSec > 0 {
++		decisionTTL = time.Duration(result.DecisionTTLSec) * time.Second
++	} else {
++		decisionTTL = defDecision
++	}
++	if decisionTTL > maxDecision {
++		decisionTTL = maxDecision
++	}
++
++	// heartbeat
++	if result.HeartbeatSec > 0 {
++		heartbeat = time.Duration(result.HeartbeatSec) * time.Second
++	} else {
++		heartbeat = defHeartbeat
++	}
++	if heartbeat < minHeartbeat {
++		heartbeat = minHeartbeat
++	}
++
++	// denyTTL
++	if result.TTLSec > 0 {
++		denyTTL = time.Duration(result.TTLSec) * time.Second
++	} else {
++		denyTTL = defDeny
++	}
++	if denyTTL < minDeny {
++		denyTTL = minDeny
++	}
++	if denyTTL > maxDeny {
++		denyTTL = maxDeny
++	}
++
++	allowed = (result.Status == 0)
++	return allowed, decisionTTL, heartbeat, denyTTL, result.ErrorCode, result.ErrorMessage, nil
++}
++
++func (r *remoteValidator) startJanitor(interval time.Duration) {
++	go func() {
++		t := time.NewTicker(interval)
++		defer t.Stop()
++
++		for range t.C {
++			now := time.Now()
++
++			r.cache.Range(func(k, v any) bool {
++				e, ok := v.(cachedStatus)
++				if !ok {
++					r.cache.Delete(k)
++					return true
++				}
++
++				if !e.allowed {
++					// Deny entry is only relevant until denyUntil.
++					if !e.denyUntil.IsZero() && now.After(e.denyUntil) {
++						r.cache.Delete(k)
++					}
++					return true
++				}
++
++				// Allow entry is only relevant until decisionUntil.
++				if e.decisionUntil.IsZero() || now.After(e.decisionUntil) {
++					r.cache.Delete(k)
++					return true
++				}
++
++				return true
++			})
++		}
++	}()
++}
++
++// Ensure interface compliance.
++var _ vless.Validator = (*remoteValidator)(nil)
+diff --git a/proxy/vless/outbound/config.pb.go b/proxy/vless/outbound/config.pb.go
+index ed5db785..d8368d3f 100644
+--- a/proxy/vless/outbound/config.pb.go
++++ b/proxy/vless/outbound/config.pb.go
+@@ -1,7 +1,7 @@
+ // Code generated by protoc-gen-go. DO NOT EDIT.
+ // versions:
+ // 	protoc-gen-go v1.35.1
+-// 	protoc        v5.28.2
++// 	protoc        v5.29.3
+ // source: proxy/vless/outbound/config.proto
+ 
+ package outbound
+@@ -27,6 +27,7 @@ type Config struct {
+ 	unknownFields protoimpl.UnknownFields
+ 
+ 	Vnext *protocol.ServerEndpoint `protobuf:"bytes,1,opt,name=vnext,proto3" json:"vnext,omitempty"`
++	Relay bool                     `protobuf:"varint,2,opt,name=relay,proto3" json:"relay,omitempty"`
+ }
+ 
+ func (x *Config) Reset() {
+@@ -66,6 +67,13 @@ func (x *Config) GetVnext() *protocol.ServerEndpoint {
+ 	return nil
+ }
+ 
++func (x *Config) GetRelay() bool {
++	if x != nil {
++		return x.Relay
++	}
++	return false
++}
++
+ var File_proxy_vless_outbound_config_proto protoreflect.FileDescriptor
+ 
+ var file_proxy_vless_outbound_config_proto_rawDesc = []byte{
+@@ -75,18 +83,20 @@ var file_proxy_vless_outbound_config_proto_rawDesc = []byte{
+ 	0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x6f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x1a, 0x21,
+ 	0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x63, 0x6f, 0x6c, 0x2f,
+ 	0x73, 0x65, 0x72, 0x76, 0x65, 0x72, 0x5f, 0x73, 0x70, 0x65, 0x63, 0x2e, 0x70, 0x72, 0x6f, 0x74,
+-	0x6f, 0x22, 0x44, 0x0a, 0x06, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x12, 0x3a, 0x0a, 0x05, 0x76,
++	0x6f, 0x22, 0x5a, 0x0a, 0x06, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x12, 0x3a, 0x0a, 0x05, 0x76,
+ 	0x6e, 0x65, 0x78, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x24, 0x2e, 0x78, 0x72, 0x61,
+ 	0x79, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x63, 0x6f,
+ 	0x6c, 0x2e, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x45, 0x6e, 0x64, 0x70, 0x6f, 0x69, 0x6e, 0x74,
+-	0x52, 0x05, 0x76, 0x6e, 0x65, 0x78, 0x74, 0x42, 0x6d, 0x0a, 0x1d, 0x63, 0x6f, 0x6d, 0x2e, 0x78,
+-	0x72, 0x61, 0x79, 0x2e, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2e, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e,
+-	0x6f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x50, 0x01, 0x5a, 0x2e, 0x67, 0x69, 0x74, 0x68,
+-	0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78, 0x72, 0x61, 0x79,
+-	0x2d, 0x63, 0x6f, 0x72, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2f, 0x76, 0x6c, 0x65, 0x73,
+-	0x73, 0x2f, 0x6f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0xaa, 0x02, 0x19, 0x58, 0x72, 0x61,
+-	0x79, 0x2e, 0x50, 0x72, 0x6f, 0x78, 0x79, 0x2e, 0x56, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x4f, 0x75,
+-	0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x52, 0x05, 0x76, 0x6e, 0x65, 0x78, 0x74, 0x12, 0x14, 0x0a, 0x05, 0x72, 0x65, 0x6c, 0x61, 0x79,
++	0x18, 0x02, 0x20, 0x01, 0x28, 0x08, 0x52, 0x05, 0x72, 0x65, 0x6c, 0x61, 0x79, 0x42, 0x6d, 0x0a,
++	0x1d, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2e,
++	0x76, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x6f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x50, 0x01,
++	0x5a, 0x2e, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x78, 0x74, 0x6c,
++	0x73, 0x2f, 0x78, 0x72, 0x61, 0x79, 0x2d, 0x63, 0x6f, 0x72, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x78,
++	0x79, 0x2f, 0x76, 0x6c, 0x65, 0x73, 0x73, 0x2f, 0x6f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64,
++	0xaa, 0x02, 0x19, 0x58, 0x72, 0x61, 0x79, 0x2e, 0x50, 0x72, 0x6f, 0x78, 0x79, 0x2e, 0x56, 0x6c,
++	0x65, 0x73, 0x73, 0x2e, 0x4f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x62, 0x06, 0x70, 0x72,
++	0x6f, 0x74, 0x6f, 0x33,
+ }
+ 
+ var (
+diff --git a/proxy/vless/outbound/config.proto b/proxy/vless/outbound/config.proto
+index 150b2d6c..66dfa21d 100644
+--- a/proxy/vless/outbound/config.proto
++++ b/proxy/vless/outbound/config.proto
+@@ -10,4 +10,5 @@ import "common/protocol/server_spec.proto";
+ 
+ message Config {
+   xray.common.protocol.ServerEndpoint vnext = 1;
++  bool relay = 2;
+ }
+diff --git a/proxy/vless/outbound/outbound.go b/proxy/vless/outbound/outbound.go
+index 17e82210..5184c8bb 100644
+--- a/proxy/vless/outbound/outbound.go
++++ b/proxy/vless/outbound/outbound.go
+@@ -52,6 +52,7 @@ type Handler struct {
+ 	server        *protocol.ServerSpec
+ 	policyManager policy.Manager
+ 	cone          bool
++	relay         bool
+ 	encryption    *encryption.ClientInstance
+ 	reverse       *Reverse
+ 
+@@ -80,6 +81,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
+ 		server:        server,
+ 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
+ 		cone:          ctx.Value("cone").(bool),
++		relay:         config.GetRelay(),
+ 	}
+ 
+ 	a := handler.server.User.Account.(*vless.MemoryAccount)
+@@ -222,9 +224,28 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
+ 		}
+ 	}
+ 
++	// In relay mode, use the original client UUID and ClientVersion instead of configured ones.
++	user := rec.User
++	var relayClientVersion string
++	if h.relay {
++		ib := session.InboundFromContext(ctx)
++		if ib != nil && len(ib.RelayUUID) == 16 {
++			var relayID [16]byte
++			copy(relayID[:], ib.RelayUUID)
++			account := rec.User.Account.(*vless.MemoryAccount)
++			user = &protocol.MemoryUser{
++				Account: &vless.MemoryAccount{ID: protocol.NewID(relayID), Flow: account.Flow},
++				Level:   rec.User.Level,
++			}
++			relayClientVersion = ib.RelayClientVersion
++		} else {
++			errors.LogDebug(ctx, "relay outbound: no RelayUUID in inbound context — falling back to configured UUID (possible misconfig or non-VLESS inbound)")
++		}
++	}
++
+ 	request := &protocol.RequestHeader{
+ 		Version: encoding.Version,
+-		User:    rec.User,
++		User:    user,
+ 		Command: command,
+ 		Address: target.Address,
+ 		Port:    target.Port,
+@@ -235,6 +256,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
+ 	requestAddons := &encoding.Addons{
+ 		Flow: account.Flow,
+ 	}
++	if relayClientVersion != "" {
++		requestAddons.ClientVersion = relayClientVersion
++	}
+ 
+ 	var input *bytes.Reader
+ 	var rawInput *bytes.Buffer
+diff --git a/proxy/vless/validator.go b/proxy/vless/validator.go
+index 35a4469a..7b581508 100644
+--- a/proxy/vless/validator.go
++++ b/proxy/vless/validator.go
+@@ -11,6 +11,9 @@ import (
+ 
+ type Validator interface {
+ 	Get(id uuid.UUID) *protocol.MemoryUser
++	// GetWithMeta validates the UUID and passes client metadata (e.g. app version)
++	// to the validation backend. Falls back to Get() for validators that don't need metadata.
++	GetWithMeta(id uuid.UUID, clientVersion string) *protocol.MemoryUser
+ 	Add(u *protocol.MemoryUser) error
+ 	Del(email string) error
+ 	GetByEmail(email string) *protocol.MemoryUser
+@@ -58,6 +61,11 @@ func (v *MemoryValidator) Del(e string) error {
+ 	return nil
+ }
+ 
++// GetWithMeta validates UUID — MemoryValidator ignores clientVersion.
++func (v *MemoryValidator) GetWithMeta(id uuid.UUID, clientVersion string) *protocol.MemoryUser {
++	return v.Get(id)
++}
++
+ // Get a VLESS user with UUID, nil if user doesn't exist.
+ func (v *MemoryValidator) Get(id uuid.UUID) *protocol.MemoryUser {
+ 	u, _ := v.users.Load(ProcessUUID(id))

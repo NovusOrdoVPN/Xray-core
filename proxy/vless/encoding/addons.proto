@@ -9,4 +9,8 @@ option java_multiple_files = true;
 message Addons {
   string Flow = 1;
   bytes Seed = 2;
+  // CUSTOM: AuthVerified (server→client) signals successful auth for remote validator feature.
+  bool AuthVerified = 3;
+  // CUSTOM: ClientVersion (client→server) carries client app version for tower validation/enforcement.
+  string ClientVersion = 4;
 }
