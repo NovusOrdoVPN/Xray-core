@@ -86,6 +86,24 @@ func (o *Observer) background() {
 			sleepTime = time.Duration(o.config.ProbeInterval)
 		}
 
+		if o.config.Lazy {
+			// New path, remote-switchable (observatory.lazy). A panic here must never kill
+			// the observatory loop: recover, log, and carry on with the next cycle.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						errors.LogError(o.ctx, "observatory lazy cycle panicked: ", r)
+					}
+				}()
+				o.probeTiers(outbounds, o.probe)
+			}()
+			if o.finished.Done() {
+				return
+			}
+			time.Sleep(sleepTime)
+			continue
+		}
+
 		if !o.config.EnableConcurrency {
 			sort.Strings(outbounds)
 			for _, v := range outbounds {
@@ -118,6 +136,49 @@ func (o *Observer) background() {
 		}
 		time.Sleep(sleepTime)
 	}
+}
+
+// probeTiers runs one lazy cycle: tiers (tag prefix up to the second dash) are
+// probed one at a time, concurrently inside a tier, in priority order. After a
+// tier completes, if any outbound in that tier or above is alive, the remaining
+// tiers are left untouched (status unknown or stale) — e.g. VK is never probed
+// while TimeWeb works. The first tier is always probed, so a recovered higher
+// path is noticed. `probe` is injectable for tests.
+func (o *Observer) probeTiers(outbounds []string, probe func(string) ProbeResult) {
+	var probedSoFar []string
+	for _, tier := range groupByTier(outbounds) {
+		results := make([]ProbeResult, len(tier))
+		var wg sync.WaitGroup
+		for i, tag := range tier {
+			wg.Add(1)
+			go func(i int, tag string) {
+				defer wg.Done()
+				results[i] = probe(tag)
+			}(i, tag)
+		}
+		wg.Wait()
+		for i, tag := range tier {
+			o.updateStatusForResult(tag, &results[i])
+		}
+		probedSoFar = append(probedSoFar, tier...)
+		if o.anyAlive(probedSoFar) {
+			return
+		}
+		if o.finished != nil && o.finished.Done() {
+			return
+		}
+	}
+}
+
+func (o *Observer) anyAlive(tags []string) bool {
+	o.statusLock.Lock()
+	defer o.statusLock.Unlock()
+	for _, tag := range tags {
+		if i := o.findStatusLocationLockHolderOnly(tag); i != -1 && o.status[i].Alive {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *Observer) clearRemovedOutbounds(outbounds []string) {
