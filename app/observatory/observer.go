@@ -25,12 +25,20 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// probeCounter tracks consecutive results per outbound for the rise/fall thresholds.
+type probeCounter struct {
+	consecutivePass uint32
+	consecutiveFail uint32
+	everProbed      bool
+}
+
 type Observer struct {
 	config *Config
 	ctx    context.Context
 
 	statusLock sync.Mutex
 	status     []*OutboundStatus
+	counters   map[string]*probeCounter // guarded by statusLock
 
 	finished *done.Instance
 
@@ -125,6 +133,30 @@ func (o *Observer) clearRemovedOutbounds(outbounds []string) {
 		}
 	}
 	o.status = pruned
+	for tag := range o.counters {
+		if !slices.Contains(outbounds, tag) {
+			delete(o.counters, tag)
+		}
+	}
+}
+
+func thresholdOrOne(v uint32) uint32 {
+	if v == 0 {
+		return 1
+	}
+	return v
+}
+
+func (o *Observer) counterLockHolderOnly(outbound string) *probeCounter {
+	if o.counters == nil {
+		o.counters = map[string]*probeCounter{}
+	}
+	c, ok := o.counters[outbound]
+	if !ok {
+		c = &probeCounter{}
+		o.counters[outbound] = c
+	}
+	return c
 }
 
 func (o *Observer) probe(outbound string) ProbeResult {
@@ -205,17 +237,33 @@ func (o *Observer) updateStatusForResult(outbound string, result *ProbeResult) {
 		o.status = append(o.status, status)
 	}
 
+	c := o.counterLockHolderOnly(outbound)
+	rise, fall := thresholdOrOne(o.config.GetRise()), thresholdOrOne(o.config.GetFall())
+
 	status.LastTryTime = time.Now().Unix()
 	status.OutboundTag = outbound
-	status.Alive = result.Alive
 	if result.Alive {
-		status.Delay = result.Delay
-		status.LastSeenTime = status.LastTryTime
-		status.LastErrorReason = ""
+		c.consecutivePass++
+		c.consecutiveFail = 0
+		// Cold start (never probed before) needs one pass; a revival needs `rise` passes in a row.
+		// With rise <= 1 this is exactly the upstream behaviour.
+		if !c.everProbed || status.Alive || c.consecutivePass >= rise {
+			status.Alive = true
+			status.Delay = result.Delay
+			status.LastSeenTime = status.LastTryTime
+			status.LastErrorReason = ""
+		}
 	} else {
-		status.LastErrorReason = result.LastErrorReason
-		status.Delay = 99999999
+		c.consecutiveFail++
+		c.consecutivePass = 0
+		// With fall <= 1 this is exactly the upstream behaviour: one failure marks dead.
+		if !c.everProbed || !status.Alive || c.consecutiveFail >= fall {
+			status.Alive = false
+			status.LastErrorReason = result.LastErrorReason
+			status.Delay = 99999999
+		}
 	}
+	c.everProbed = true
 }
 
 func (o *Observer) findStatusLocationLockHolderOnly(outbound string) int {
