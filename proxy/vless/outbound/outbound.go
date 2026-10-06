@@ -277,6 +277,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	// overriding the local GetClientVersion() — only meaningful when the relay outbound is active.
 	if relayClientVersion != "" {
 		requestAddons.ClientVersion = relayClientVersion
+	} else if obs := session.OutboundsFromContext(ctx); len(obs) > 0 && obs[len(obs)-1] != nil {
+		// CUSTOM: client telemetry — record which outbound (direct-NN / relay-GG-NN) this
+		// connection uses, so the exit and the tower can count users per path. Not in
+		// relay mode: the relay forwards the original client's string untouched.
+		requestAddons.ClientVersion = encoding.AppendVia(requestAddons.ClientVersion, obs[len(obs)-1].Tag)
 	}
 
 	var input *bytes.Reader
