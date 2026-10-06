@@ -587,6 +587,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	// so ProcessUUID()'s zeroing of bytes 6-7 doesn't destroy routing info.
 	inbound.VlessRoute = net.PortFromBytes(userSentID[8:10])
 	// CUSTOM-END
+	// CUSTOM: client telemetry — keep the client's version string on the session so the
+	// dispatcher can attach its metadata to the per-inbound online entry.
+	if requestAddons != nil {
+		inbound.ClientVersion = requestAddons.GetClientVersion()
+	}
 	// CUSTOM-BEGIN: relay-mode UUID/ClientVersion passthrough
 	// When the relay validator is active, capture the original UUID and ClientVersion
 	// so the outbound (with "relay": true) can forward them to the exit server.

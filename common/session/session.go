@@ -57,6 +57,9 @@ type Inbound struct {
 	// CUSTOM: RelayClientVersion holds the client's version string from VLESS addons,
 	// captured alongside RelayUUID for relay-mode outbound passthrough.
 	RelayClientVersion string
+	// CUSTOM: ClientVersion is the client's version string from VLESS addons for every
+	// request (not only relay mode) — client telemetry for the per-inbound online map.
+	ClientVersion string
 	// Used by splice copy. Conn is actually internet.Connection. May be nil.
 	Conn net.Conn
 	// Used by splice copy. Timer of the inbound buf copier. May be nil.

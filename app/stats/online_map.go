@@ -11,9 +11,12 @@ const (
 	localhostIPv6 = "[::1]"
 )
 
+const maxAttrBytes = 256
+
 type ipEntry struct {
 	refCount int
 	lastSeen int64
+	attr     string // CUSTOM: client telemetry metadata, see SetAttr
 }
 
 // OnlineMap is a refcount-based implementation of stats.OnlineMap.
@@ -73,6 +76,34 @@ func (om *OnlineMap) RemoveIP(ip string) {
 // Count implements stats.OnlineMap.
 func (om *OnlineMap) Count() int {
 	return int(om.count.Load())
+}
+
+// SetAttr implements stats.OnlineMap: records the client metadata string for an
+// online identity (last value wins, capped). Unknown identities are ignored so an
+// attribute can never create a phantom online entry.
+func (om *OnlineMap) SetAttr(ip, attr string) {
+	if len(attr) > maxAttrBytes {
+		attr = attr[:maxAttrBytes]
+	}
+	om.access.Lock()
+	defer om.access.Unlock()
+	e, ok := om.entries[ip]
+	if !ok {
+		return
+	}
+	e.attr = attr
+	om.entries[ip] = e
+}
+
+// ForEachAttr implements stats.OnlineMap.
+func (om *OnlineMap) ForEachAttr(fn func(string, int64, string) bool) {
+	om.access.Lock()
+	defer om.access.Unlock()
+	for ip, e := range om.entries {
+		if !fn(ip, e.lastSeen, e.attr) {
+			break
+		}
+	}
 }
 
 // ForEach calls fn for each online IP. If fn returns false, iteration stops.
