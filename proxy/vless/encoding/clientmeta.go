@@ -12,7 +12,9 @@ import (
 // telemetry only. Readers are tolerant: a malformed or oversized third part never
 // affects anything, unknown keys are ignored, the first occurrence of a key wins.
 
-const clientMetaMaxBytes = 256
+// 200, not 256: the VLESS addons length on the wire is a single byte and the flow
+// name plus protobuf framing take ~20 of the 255; see EncodeHeaderAddons.
+const clientMetaMaxBytes = 200
 
 // ClientMeta is the parsed third part. Zero value = "unknown everywhere".
 type ClientMeta struct {
@@ -110,6 +112,15 @@ func lastRune(s string) (rune, int) {
 		}
 	}
 	return 0, 1
+}
+
+// clientVersionWithoutMeta drops the telemetry part: "a|b|k=v" → "a|b"; "a|b" / "a" unchanged.
+func clientVersionWithoutMeta(v string) string {
+	parts := strings.SplitN(v, "|", 3)
+	if len(parts) < 3 {
+		return v
+	}
+	return parts[0] + "|" + parts[1]
 }
 
 // AppendVia sets via=<tag> in the third part of the client version string, replacing

@@ -1,8 +1,11 @@
 package encoding
 
 import (
+	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/xtls/xray-core/common/buf"
 )
 
 func TestParseClientMetaTwoPart(t *testing.T) {
@@ -56,5 +59,46 @@ func TestAppendVia(t *testing.T) {
 	}
 	if AppendVia("1.3.1|3", "") != "1.3.1|3" {
 		t.Fatal("empty tag must not change the string")
+	}
+}
+
+// REVIEW (critical): the addons length on the wire is ONE byte. A long but "legal"
+// client version string must never produce an undecodable header: the encoder
+// trims the telemetry part (never the version parts) until the payload fits.
+func TestEncodeHeaderAddonsNeverExceedsOneByteLength(t *testing.T) {
+	for _, n := range []int{200, 235, 242, 256, 400} {
+		cv := "1.3.1|3|city=" + strings.Repeat("c", n-14) // total ≈ n bytes
+		addons := &Addons{Flow: "xtls-rprx-vision", ClientVersion: cv}
+		b := buf.New()
+		if err := EncodeHeaderAddons(b, addons); err != nil {
+			t.Fatalf("encode %d: %v", n, err)
+		}
+		got, err := DecodeHeaderAddons(buf.New(), bytes.NewReader(b.Bytes()))
+		if err != nil {
+			t.Fatalf("round trip failed for a %d-byte client version: %v", n, err)
+		}
+		if !strings.HasPrefix(got.ClientVersion, "1.3.1|3") {
+			t.Fatalf("version parts must survive, got %q", got.ClientVersion)
+		}
+		if got.Flow != "xtls-rprx-vision" {
+			t.Fatalf("flow must survive, got %q", got.Flow)
+		}
+	}
+	// A string within the cap chain round-trips unchanged.
+	short := "1.3.1|3|os=ios;osv=18.6;net=cell;tz=Europe/Moscow;city=Sochi;asn=31163;via=relay-01-00"
+	b := buf.New()
+	if err := EncodeHeaderAddons(b, &Addons{Flow: "xtls-rprx-vision", ClientVersion: short}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeHeaderAddons(buf.New(), bytes.NewReader(b.Bytes()))
+	if err != nil || got.ClientVersion != short {
+		t.Fatalf("short string must round-trip unchanged: %v %q", err, got.ClientVersion)
+	}
+}
+
+func TestAppendViaCapIs200(t *testing.T) {
+	long := "1.3.1|3|city=" + strings.Repeat("c", 300)
+	if got := AppendVia(long, "direct-00"); len(got) > 200 {
+		t.Fatalf("AppendVia must cap at 200 bytes (one-byte addons length on the wire), got %d", len(got))
 	}
 }
