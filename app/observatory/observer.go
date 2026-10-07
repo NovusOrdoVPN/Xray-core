@@ -25,12 +25,20 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// probeCounter tracks consecutive results per outbound for the rise/fall thresholds.
+type probeCounter struct {
+	consecutivePass uint32
+	consecutiveFail uint32
+	everProbed      bool
+}
+
 type Observer struct {
 	config *Config
 	ctx    context.Context
 
 	statusLock sync.Mutex
 	status     []*OutboundStatus
+	counters   map[string]*probeCounter // guarded by statusLock
 
 	finished *done.Instance
 
@@ -78,6 +86,24 @@ func (o *Observer) background() {
 			sleepTime = time.Duration(o.config.ProbeInterval)
 		}
 
+		if o.config.Lazy {
+			// New path, remote-switchable (observatory.lazy). A panic here must never kill
+			// the observatory loop: recover, log, and carry on with the next cycle.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						errors.LogError(o.ctx, "observatory lazy cycle panicked: ", r)
+					}
+				}()
+				o.probeTiers(outbounds, o.probe)
+			}()
+			if o.finished.Done() {
+				return
+			}
+			time.Sleep(sleepTime)
+			continue
+		}
+
 		if !o.config.EnableConcurrency {
 			sort.Strings(outbounds)
 			for _, v := range outbounds {
@@ -112,6 +138,49 @@ func (o *Observer) background() {
 	}
 }
 
+// probeTiers runs one lazy cycle: tiers (tag prefix up to the second dash) are
+// probed one at a time, concurrently inside a tier, in priority order. After a
+// tier completes, if any outbound in that tier or above is alive, the remaining
+// tiers are left untouched (status unknown or stale) — e.g. VK is never probed
+// while TimeWeb works. The first tier is always probed, so a recovered higher
+// path is noticed. `probe` is injectable for tests.
+func (o *Observer) probeTiers(outbounds []string, probe func(string) ProbeResult) {
+	var probedSoFar []string
+	for _, tier := range groupByTier(outbounds) {
+		results := make([]ProbeResult, len(tier))
+		var wg sync.WaitGroup
+		for i, tag := range tier {
+			wg.Add(1)
+			go func(i int, tag string) {
+				defer wg.Done()
+				results[i] = probe(tag)
+			}(i, tag)
+		}
+		wg.Wait()
+		for i, tag := range tier {
+			o.updateStatusForResult(tag, &results[i])
+		}
+		probedSoFar = append(probedSoFar, tier...)
+		if o.anyAlive(probedSoFar) {
+			return
+		}
+		if o.finished != nil && o.finished.Done() {
+			return
+		}
+	}
+}
+
+func (o *Observer) anyAlive(tags []string) bool {
+	o.statusLock.Lock()
+	defer o.statusLock.Unlock()
+	for _, tag := range tags {
+		if i := o.findStatusLocationLockHolderOnly(tag); i != -1 && o.status[i].Alive {
+			return true
+		}
+	}
+	return false
+}
+
 func (o *Observer) clearRemovedOutbounds(outbounds []string) {
 	o.statusLock.Lock()
 	defer o.statusLock.Unlock()
@@ -125,6 +194,30 @@ func (o *Observer) clearRemovedOutbounds(outbounds []string) {
 		}
 	}
 	o.status = pruned
+	for tag := range o.counters {
+		if !slices.Contains(outbounds, tag) {
+			delete(o.counters, tag)
+		}
+	}
+}
+
+func thresholdOrOne(v uint32) uint32 {
+	if v == 0 {
+		return 1
+	}
+	return v
+}
+
+func (o *Observer) counterLockHolderOnly(outbound string) *probeCounter {
+	if o.counters == nil {
+		o.counters = map[string]*probeCounter{}
+	}
+	c, ok := o.counters[outbound]
+	if !ok {
+		c = &probeCounter{}
+		o.counters[outbound] = c
+	}
+	return c
 }
 
 func (o *Observer) probe(outbound string) ProbeResult {
@@ -205,17 +298,33 @@ func (o *Observer) updateStatusForResult(outbound string, result *ProbeResult) {
 		o.status = append(o.status, status)
 	}
 
+	c := o.counterLockHolderOnly(outbound)
+	rise, fall := thresholdOrOne(o.config.GetRise()), thresholdOrOne(o.config.GetFall())
+
 	status.LastTryTime = time.Now().Unix()
 	status.OutboundTag = outbound
-	status.Alive = result.Alive
 	if result.Alive {
-		status.Delay = result.Delay
-		status.LastSeenTime = status.LastTryTime
-		status.LastErrorReason = ""
+		c.consecutivePass++
+		c.consecutiveFail = 0
+		// Cold start (never probed before) needs one pass; a revival needs `rise` passes in a row.
+		// With rise <= 1 this is exactly the upstream behaviour.
+		if !c.everProbed || status.Alive || c.consecutivePass >= rise {
+			status.Alive = true
+			status.Delay = result.Delay
+			status.LastSeenTime = status.LastTryTime
+			status.LastErrorReason = ""
+		}
 	} else {
-		status.LastErrorReason = result.LastErrorReason
-		status.Delay = 99999999
+		c.consecutiveFail++
+		c.consecutivePass = 0
+		// With fall <= 1 this is exactly the upstream behaviour: one failure marks dead.
+		if !c.everProbed || !status.Alive || c.consecutiveFail >= fall {
+			status.Alive = false
+			status.LastErrorReason = result.LastErrorReason
+			status.Delay = 99999999
+		}
 	}
+	c.everProbed = true
 }
 
 func (o *Observer) findStatusLocationLockHolderOnly(outbound string) int {

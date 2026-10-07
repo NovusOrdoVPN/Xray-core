@@ -189,7 +189,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 					trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
 				}
 				// CUSTOM: per-inbound online tracking (helpers in custom_online.go).
-				trackInboundOnline(ctx, d.stats, sessionInbound.Tag, userOnlineIdentity(user))
+				trackInboundOnline(ctx, d.stats, sessionInbound.Tag, userOnlineIdentity(user), sessionInbound.ClientVersion)
 			}
 		}
 	}
@@ -231,7 +231,7 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 					trackOnlineIP(ctx, statsManager, user.Email, sessionInbound.Source.Address.String())
 				}
 				// CUSTOM: per-inbound online tracking (helpers in custom_online.go).
-				trackInboundOnline(ctx, statsManager, sessionInbound.Tag, userOnlineIdentity(user))
+				trackInboundOnline(ctx, statsManager, sessionInbound.Tag, userOnlineIdentity(user), sessionInbound.ClientVersion)
 			}
 		}
 	}

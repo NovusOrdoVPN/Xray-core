@@ -27,6 +27,26 @@ func EncodeHeaderAddons(buffer *buf.Buffer, addons *Addons) error {
 		if err != nil {
 			return errors.New("failed to marshal addons protobuf value").Base(err)
 		}
+		// CUSTOM: the length below is ONE byte. The client telemetry part of
+		// ClientVersion ("<app>|<cfg>|k=v;...") is capped upstream, but never trust
+		// it: trim the telemetry part, then the whole version, rather than ever
+		// writing a wrapped length the server cannot decode.
+		if len(bytes) > 255 && addons.ClientVersion != "" {
+			trimmed := proto.Clone(addons).(*Addons)
+			trimmed.ClientVersion = clientVersionWithoutMeta(trimmed.ClientVersion)
+			if bytes, err = proto.Marshal(trimmed); err != nil {
+				return errors.New("failed to marshal addons protobuf value").Base(err)
+			}
+			if len(bytes) > 255 {
+				trimmed.ClientVersion = ""
+				if bytes, err = proto.Marshal(trimmed); err != nil {
+					return errors.New("failed to marshal addons protobuf value").Base(err)
+				}
+			}
+		}
+		if len(bytes) > 255 {
+			return errors.New("addons protobuf value too long for the one-byte length prefix")
+		}
 		if err := buffer.WriteByte(byte(len(bytes))); err != nil {
 			return errors.New("failed to write addons protobuf length").Base(err)
 		}

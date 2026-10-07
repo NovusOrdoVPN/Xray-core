@@ -34,6 +34,11 @@ type OnlineMap interface {
 	// If fn returns false, iteration stops.
 	// The callback must not call AddIP/RemoveIP on the same OnlineMap (would deadlock).
 	ForEach(func(string, int64) bool)
+	// CUSTOM: SetAttr stores a short attribute string for an online IP (client
+	// telemetry: the client version string's metadata). No-op for unknown IPs.
+	SetAttr(ip, attr string)
+	// CUSTOM: ForEachAttr is ForEach with the stored attribute ("" when none).
+	ForEachAttr(func(ip string, lastSeen int64, attr string) bool)
 }
 
 // Channel is the interface for stats channel.

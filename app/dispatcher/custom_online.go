@@ -14,6 +14,7 @@ package dispatcher
 
 import (
 	"context"
+	"strings"
 
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/features/stats"
@@ -38,13 +39,31 @@ func userOnlineIdentity(user *protocol.MemoryUser) string {
 // inbound tag. The admin portal consumes this via /online and /online-users
 // to report concurrent users per inbound. RemoveIP is paired via
 // context.AfterFunc so the refcount-based OnlineMap decrements on disconnect.
-func trackInboundOnline(ctx context.Context, sm stats.Manager, inboundTag, identity string) {
+func trackInboundOnline(ctx context.Context, sm stats.Manager, inboundTag, identity, clientVersion string) {
 	if inboundTag == "" || identity == "" {
 		return
 	}
 	name := "inbound>>>" + inboundTag + ">>>online"
 	if om, _ := stats.GetOrRegisterOnlineMap(sm, name); om != nil {
 		om.AddIP(identity)
+		// Client telemetry: the metadata part of the version string ("<app>|<cfg>|k=v;...") — only
+		// the third part is kept; nothing else about the user. Empty when the app is old.
+		if attr := clientMetaPart(clientVersion); attr != "" {
+			om.SetAttr(identity, attr)
+		}
 		context.AfterFunc(ctx, func() { om.RemoveIP(identity) })
 	}
+}
+
+// clientMetaPart returns the third '|'-separated part of a client version string, or "".
+func clientMetaPart(v string) string {
+	first := strings.IndexByte(v, '|')
+	if first < 0 {
+		return ""
+	}
+	second := strings.IndexByte(v[first+1:], '|')
+	if second < 0 {
+		return ""
+	}
+	return v[first+1+second+1:]
 }

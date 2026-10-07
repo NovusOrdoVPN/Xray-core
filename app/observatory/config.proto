@@ -81,4 +81,16 @@ message Config {
   int64 probe_interval = 4;
 
   bool enable_concurrency = 5;
+
+  /* @Document Consecutive passing probes needed to mark an outbound alive again after it was marked dead. 0 or 1 = one pass (upstream behaviour). The first ever probe of an outbound needs one pass regardless.
+  */
+  uint32 rise = 6;
+
+  /* @Document Consecutive failing probes needed to mark an outbound dead. 0 or 1 = one failure (upstream behaviour).
+  */
+  uint32 fall = 7;
+
+  /* @Document Probe one tier of outbounds at a time (tag prefix up to the second dash); when a tier has an alive outbound, lower tiers are not probed in that cycle.
+  */
+  bool lazy = 8;
 }
