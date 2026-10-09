@@ -5,7 +5,8 @@ package metrics
 // Consumed by the admin portal. Two endpoints are exposed:
 //
 //	GET /online         → { "inbound_tag": count, ... }
-//	GET /online-users   → { "asOfMs": <int64>, "direct": {uuid: lastSeenMs}, "proxy": {uuid: lastSeenMs} }
+//	GET /online-users   → { "asOfMs": <int64>, "direct": {uuid: lastSeenMs}, "proxy": {uuid: lastSeenMs},
+//	                        "attrs": {uuid: "os=…;via=…"}, "doors": {inboundTag: {uuid: lastSeenMs}} }
 //
 // Also publishes an "online" variable to expvar for /debug/vars consumers.
 //
@@ -33,6 +34,12 @@ type onlineUsersResponse struct {
 	// user ("os=ios;net=cell;asn=...;via=..."), only for users that sent one. The
 	// presence collector turns these into per-platform/network/provider counts.
 	Attrs map[string]string `json:"attrs,omitempty"`
+	// CUSTOM: per-door presence — one map per inbound tag, NOT deduplicated across
+	// doors. The presence collector buckets a user by the door it was last seen on
+	// (e.g. a relay provider whose relays the app shows as country servers). direct /
+	// proxy above keep their contract for older collectors. Omitted when there are
+	// no inbound maps.
+	Doors map[string]map[string]int64 `json:"doors,omitempty"`
 }
 
 type onlineUserPresence struct {
@@ -81,6 +88,7 @@ func buildOnlineUsersResponseFrom(visit onlineMapVisitor) onlineUsersResponse {
 		"direct": {},
 		"proxy":  {},
 	}
+	doors := map[string]map[string]int64{}
 
 	visit(func(name string, om feature_stats.OnlineMap) bool {
 		if !strings.HasPrefix(name, "inbound>>>") {
@@ -93,8 +101,16 @@ func buildOnlineUsersResponseFrom(visit onlineMapVisitor) onlineUsersResponse {
 		}
 
 		mode := classifyOnlineMode(tag)
+		door := doors[tag]
+		if door == nil {
+			door = map[string]int64{}
+			doors[tag] = door
+		}
 		om.ForEachAttr(func(userID string, lastSeen int64, attr string) bool {
 			lastSeenMs := lastSeen * 1000
+			if cur, ok := door[userID]; !ok || lastSeenMs > cur {
+				door[userID] = lastSeenMs
+			}
 			if current, found := rawByMode[mode][userID]; !found || lastSeenMs >= current {
 				rawByMode[mode][userID] = lastSeenMs
 				if attr != "" {
@@ -125,6 +141,7 @@ func buildOnlineUsersResponseFrom(visit onlineMapVisitor) onlineUsersResponse {
 		Direct: map[string]int64{},
 		Proxy:  map[string]int64{},
 		Attrs:  map[string]string{},
+		Doors:  doors,
 	}
 	for userID, presence := range winners {
 		if presence.mode == "proxy" {
