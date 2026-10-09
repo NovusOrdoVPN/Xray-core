@@ -85,12 +85,30 @@ func TestOnlineUsersDoorsPerInbound(t *testing.T) {
 	if len(resp.Doors) != 2 {
 		t.Fatalf("expected 2 doors, got %d: %v", len(resp.Doors), resp.Doors)
 	}
-	if ms, ok := resp.Doors["vless-reality"]["u1"]; !ok || ms <= 0 || ms%1000 != 0 {
-		t.Fatalf("u1 must be on the direct door with a millisecond timestamp, got %d ok=%v", ms, ok)
+	var u1Sec int64
+	direct.ForEach(func(id string, lastSeen int64) bool {
+		if id == "u1" {
+			u1Sec = lastSeen
+		}
+		return true
+	})
+	if ms, ok := resp.Doors["vless-reality"]["u1"]; !ok || u1Sec == 0 || ms != u1Sec*1000 {
+		t.Fatalf("u1 door value must be the map's lastSeen in ms: got %d want %d ok=%v", ms, u1Sec*1000, ok)
 	}
 	tw := resp.Doors["vless-reality-proxy-timeweb"]
 	if len(tw) != 2 || tw["u1"] <= 0 || tw["u2"] <= 0 {
 		t.Fatalf("timeweb door must hold u1 and u2: %v", tw)
+	}
+	// The elected direct/proxy value for a user is one of its door values (same ms conversion).
+	for id, ms := range resp.Direct {
+		if ms != resp.Doors["vless-reality"][id] && ms != tw[id] {
+			t.Fatalf("direct[%s]=%d matches no door value", id, ms)
+		}
+	}
+	for id, ms := range resp.Proxy {
+		if ms != tw[id] {
+			t.Fatalf("proxy[%s]=%d must equal the timeweb door value %d", id, ms, tw[id])
+		}
 	}
 	// direct/proxy keep today's deduplicated contract: 2 distinct users in total.
 	if len(resp.Direct)+len(resp.Proxy) != 2 {

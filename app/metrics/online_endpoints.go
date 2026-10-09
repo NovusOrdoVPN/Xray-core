@@ -71,7 +71,8 @@ func classifyOnlineMode(tag string) string {
 
 // buildOnlineUsersResponse aggregates all inbound online maps, deduplicating
 // users across inbounds by electing the mode (direct/proxy) with the most
-// recent activity for each user.
+// recent activity for each user; doors carries the raw per-inbound maps
+// (not deduplicated) alongside.
 //
 // Upstream OnlineMap.ForEach yields Unix *seconds*; convert to milliseconds for
 // the admin portal's expected precision.
